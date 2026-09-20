@@ -38,10 +38,48 @@ class ClassroomMonitoringStore {
   }
 
   getSession(id: string): LabSession | undefined {
-    const s = this.sessions.find(session => session.id === id || session.sessionCode === id);
+    if (!id) return undefined;
+    const cleanId = id.trim().replace(/^session-/i, '');
+    let s = this.sessions.find(session => {
+      const sId = session.id.replace(/^session-/i, '');
+      const sCode = (session.sessionCode || '').replace(/^session-/i, '');
+      return (
+        session.id === id ||
+        session.sessionCode === id ||
+        sId === cleanId ||
+        sCode === cleanId ||
+        session.id.toLowerCase() === id.toLowerCase() ||
+        (session.sessionCode && session.sessionCode.toLowerCase() === id.toLowerCase())
+      );
+    });
+
+    // Auto-reconstitute session if valid timestamp or code to prevent serverless dropouts
+    if (!s && cleanId && (cleanId.length >= 4 || /^\d+$/.test(cleanId))) {
+      const isTimestamp = /^\d+$/.test(cleanId);
+      const parsedDate = isTimestamp ? new Date(parseInt(cleanId, 10)) : new Date();
+      const validDate = isNaN(parsedDate.getTime()) ? new Date() : parsedDate;
+
+      s = {
+        id: cleanId,
+        sessionCode: cleanId,
+        groupCode: 'LAB-1',
+        groupName: 'Computer Lab Workstation',
+        sessionNumber: '1',
+        sessionTitle: `Computer Lab Session (${cleanId.slice(-6)})`,
+        startTime: validDate.toISOString(),
+        isActive: true,
+        status: 'active',
+        createdAt: validDate.toISOString(),
+        joinedCount: 0
+      };
+      this.sessions.unshift(s);
+    }
+
     if (!s) return undefined;
     return {
       ...s,
+      status: 'active',
+      isActive: true,
       joinedCount: this.participants[s.id]
         ? Object.keys(this.participants[s.id]).length
         : s.joinedCount || 0
@@ -49,12 +87,12 @@ class ClassroomMonitoringStore {
   }
 
   createSession(data: Partial<LabSession>): LabSession {
-    const id = data.id || `session-${Date.now()}`;
+    // Standardize to clean timestamp ID without 'session-' prefix
+    const id = String(data.id || Date.now()).replace(/^session-/i, '');
     const groupCode = data.groupCode || 'LAB-1';
     const sessionNumber = data.sessionNumber || '1';
     const sessionTitle = data.sessionTitle || 'Computer Lab Session';
-    const sessionCode =
-      data.sessionCode || `${groupCode.replace(/[^a-zA-Z0-9]/g, '')}-S${sessionNumber}`;
+    const sessionCode = data.sessionCode ? String(data.sessionCode).replace(/^session-/i, '') : id;
 
     const newSession: LabSession = {
       id,
@@ -65,7 +103,8 @@ class ClassroomMonitoringStore {
       sessionTitle,
       startTime: data.startTime || new Date().toISOString(),
       endTime: data.endTime,
-      isActive: data.isActive !== undefined ? data.isActive : true,
+      isActive: true,
+      status: 'active',
       createdAt: new Date().toISOString(),
       joinedCount: 0
     };

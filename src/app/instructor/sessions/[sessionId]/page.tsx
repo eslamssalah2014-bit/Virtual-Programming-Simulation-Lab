@@ -9,6 +9,8 @@ import {
   WebRTCLogEntry
 } from '@/lib/webrtc/signalingClient';
 import { WebRTCDebugPanel, WebRTCDebugInfo } from '@/components/common/WebRTCDebugPanel';
+import { SessionDebugPanel, SessionDebugData } from '@/components/common/SessionDebugPanel';
+import { lookupSessionEverywhere, normalizeSessionId } from '@/lib/supabase/sessions';
 import {
   Users,
   Monitor,
@@ -32,13 +34,26 @@ function InstructorLiveSessionContent() {
   const rawSessionId = (params?.sessionId as string) || 'session-101';
 
   const [session, setSession] = useState<LabSession | null>(null);
-  const [canonicalRoomId, setCanonicalRoomId] = useState<string>(rawSessionId);
+  const [canonicalRoomId, setCanonicalRoomId] = useState<string>(normalizeSessionId(rawSessionId));
   const [participants, setParticipants] = useState<LabParticipant[]>([]);
   const [focusedParticipant, setFocusedParticipant] = useState<LabParticipant | null>(null);
   const [statusFilter, setStatusFilter] = useState<'all' | 'sharing' | 'hands'>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [copied, setCopied] = useState<boolean>(false);
   const [isAttendanceModalOpen, setIsAttendanceModalOpen] = useState<boolean>(false);
+
+  // Session Debug State
+  const [sessionDebugData, setSessionDebugData] = useState<SessionDebugData>({
+    sessionId: normalizeSessionId(rawSessionId),
+    sessionCode: rawSessionId,
+    sessionStatus: 'checking...',
+    startTime: '-',
+    endTime: '-',
+    databaseRecordFound: false,
+    extractedUrlCode: rawSessionId,
+    executedQuery: `SELECT * FROM sessions WHERE id = '${normalizeSessionId(rawSessionId)}'`,
+    returnedResult: 'Querying database...'
+  });
 
   // WebRTC Multi-Peer State
   const [remoteStreams, setRemoteStreams] = useState<Record<string, MediaStream>>({});
@@ -59,25 +74,62 @@ function InstructorLiveSessionContent() {
     setLogs(prev => [entry, ...prev.slice(0, 249)]);
   };
 
-  // 1. Fetch Session Info & Resolve Canonical Room ID
+  // 1. Fetch Session Info & Resolve Canonical Room ID everywhere
   useEffect(() => {
-    fetch(`/api/sessions/${rawSessionId}`)
-      .then(res => res.json())
-      .then(data => {
-        if (data.session) {
-          setSession(data.session);
-          setCanonicalRoomId(data.session.id); // Matches student room exactly!
+    let isMounted = true;
+
+    (async () => {
+      try {
+        const lookup = await lookupSessionEverywhere(rawSessionId);
+        if (!isMounted) return;
+
+        setSessionDebugData({
+          sessionId: lookup.session?.id || normalizeSessionId(rawSessionId),
+          sessionCode: lookup.logCode,
+          sessionStatus: lookup.session?.status || (lookup.session?.isActive ? 'active' : 'inactive'),
+          startTime: lookup.session?.startTime || '-',
+          endTime: lookup.session?.endTime || '-',
+          databaseRecordFound: !!lookup.session,
+          foundIn: lookup.foundIn,
+          extractedUrlCode: rawSessionId,
+          executedQuery: lookup.logQuery,
+          returnedResult: lookup.logResult
+        });
+
+        if (lookup.session) {
+          setSession(lookup.session);
+          setCanonicalRoomId(lookup.session.id);
         }
-        if (Array.isArray(data.participants)) setParticipants(data.participants);
-      })
-      .catch(err => console.error('Failed to load session:', err));
+
+        // Also fetch any existing server-side participants
+        try {
+          const apiRes = await fetch(`/api/sessions/${rawSessionId}`);
+          const apiData = await apiRes.json();
+          if (Array.isArray(apiData.participants)) {
+            setParticipants(apiData.participants);
+          }
+        } catch (_) {}
+      } catch (err: any) {
+        console.error('Failed to load session:', err);
+      }
+    })();
+
+    return () => {
+      isMounted = false;
+    };
   }, [rawSessionId]);
 
-  // 2. Setup Unified WebRTC Signaling Channel
+  // 2. Setup Unified WebRTC Signaling Channel (Preconditions: session must be found and loaded)
   useEffect(() => {
+    if (!session || !session.id) {
+      console.log('[Instructor WebRTC] Waiting for session to be found before initializing signaling...');
+      return;
+    }
+
+    const effectiveRoomId = session.id;
     const signaling = new UnifiedSignalingClient(
       rawSessionId,
-      canonicalRoomId,
+      effectiveRoomId,
       'instructor',
       'instructor',
       addLog
@@ -85,14 +137,14 @@ function InstructorLiveSessionContent() {
     signalingRef.current = signaling;
 
     signaling.log(
-      `Instructor Station Connected | Raw: ${rawSessionId} | Canonical Room: ${canonicalRoomId} | Channel: ${signaling.channelName}`,
+      `Instructor Station Connected | Raw: ${rawSessionId} | Canonical Room: ${effectiveRoomId} | Channel: ${signaling.channelName}`,
       'success',
       'signaling'
     );
 
     // Notify room presence
     signaling.send('join_session', 'all', {
-      sessionId: canonicalRoomId,
+      sessionId: effectiveRoomId,
       rawSessionId,
       user: { id: 'instructor', role: 'instructor' }
     });
@@ -382,7 +434,7 @@ function InstructorLiveSessionContent() {
       signaling.destroy();
       signalingRef.current = null;
     };
-  }, [rawSessionId, canonicalRoomId]);
+  }, [rawSessionId, canonicalRoomId, session]);
 
   // Focus Mode Video Attachment: video.srcObject = remoteStream
   useEffect(() => {
@@ -671,6 +723,9 @@ function InstructorLiveSessionContent() {
         onClearLogs={() => setLogs([])}
         title="Instructor WebRTC Multi-Screen Stream Monitor & Verification Console"
       />
+
+      {/* Session Diagnostics Panel */}
+      <SessionDebugPanel debugData={sessionDebugData} />
 
       {/* FOCUS MODE MODAL: Full Screen Desktop Inspection */}
       {focusedParticipant && (

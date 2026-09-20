@@ -10,6 +10,8 @@ import {
   WebRTCLogEntry
 } from '@/lib/webrtc/signalingClient';
 import { WebRTCDebugPanel, WebRTCDebugInfo } from '@/components/common/WebRTCDebugPanel';
+import { SessionDebugPanel, SessionDebugData } from '@/components/common/SessionDebugPanel';
+import { lookupSessionEverywhere, normalizeSessionId } from '@/lib/supabase/sessions';
 import {
   MonitorPlay,
   MonitorOff,
@@ -42,6 +44,16 @@ function StudentLabWorkstationContent() {
 
   const [session, setSession] = useState<LabSession | null>(null);
   const [canonicalRoomId, setCanonicalRoomId] = useState<string>(rawSessionId);
+  const [sessionDebugData, setSessionDebugData] = useState<SessionDebugData>({
+    sessionId: normalizeSessionId(rawSessionId),
+    sessionCode: normalizeSessionId(rawSessionId),
+    sessionStatus: 'active',
+    databaseRecordFound: false,
+    extractedUrlCode: rawSessionId,
+    executedQuery: `SELECT * FROM sessions WHERE id = '${normalizeSessionId(rawSessionId)}'`,
+    returnedResult: 'Querying database...'
+  });
+
   const [isScreenSharing, setIsScreenSharing] = useState<boolean>(false);
   const [isHandRaised, setIsHandRaised] = useState<boolean>(false);
   const [isHelpModalOpen, setIsHelpModalOpen] = useState<boolean>(false);
@@ -86,22 +98,38 @@ function StudentLabWorkstationContent() {
     }
   }, [searchParams, currentUser]);
 
-  // 2. Fetch Session & Resolve Canonical Room ID
+  // 2. Fetch Session & Resolve Canonical Room ID via lookupSessionEverywhere
   useEffect(() => {
-    fetch(`/api/sessions/${rawSessionId}`)
-      .then(res => res.json())
-      .then(data => {
-        if (data.session) {
-          setSession(data.session);
-          setCanonicalRoomId(data.session.id); // Ensures exact room match with instructor!
-        }
-      })
-      .catch(err => console.error('Failed to load session details:', err));
+    async function resolveSession() {
+      const result = await lookupSessionEverywhere(rawSessionId);
+      console.log(`[Student Lab URL Code]: ${result.logCode}`);
+      console.log(`[Student Lab Database Query]: ${result.logQuery}`);
+      console.log(`[Student Lab Result]: ${result.logResult}`);
+
+      if (result.session) {
+        setSession(result.session);
+        setCanonicalRoomId(result.session.id); // Matches instructor room format
+        setSessionDebugData({
+          sessionId: result.session.id,
+          sessionCode: result.session.sessionCode || result.session.id,
+          sessionStatus: result.session.status || 'active',
+          startTime: result.session.startTime,
+          endTime: result.session.endTime,
+          databaseRecordFound: true,
+          foundIn: result.foundIn,
+          extractedUrlCode: result.logCode,
+          executedQuery: result.logQuery,
+          returnedResult: result.logResult
+        });
+      }
+    }
+    resolveSession();
   }, [rawSessionId]);
 
-  // 3. Initialize Unified Signaling Client
+  // 3. Initialize Unified Signaling Client ONLY after session is loaded from database (Requirement 6)
   useEffect(() => {
-    if (!isIdentityConfirmed || hasLeft) return;
+    // Prevent WebRTC initialization until the session is successfully found and loaded
+    if (!isIdentityConfirmed || hasLeft || !session || !session.id) return;
 
     const studentUid = getEffectiveStudentUid();
     const signaling = new UnifiedSignalingClient(
@@ -839,6 +867,9 @@ function StudentLabWorkstationContent() {
         onTriggerOffer={handleTriggerOffer}
         title="Student WebRTC Signaling & Stream Verification Console"
       />
+
+      {/* Session Database & Lookup Diagnostics Panel */}
+      <SessionDebugPanel debugData={sessionDebugData} />
 
       {/* Need Help Ticket Modal */}
       {isHelpModalOpen && (

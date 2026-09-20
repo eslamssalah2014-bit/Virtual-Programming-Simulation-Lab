@@ -21,6 +21,7 @@ import {
   Radio
 } from 'lucide-react';
 import { LabSession } from '@/types';
+import { insertSessionToSupabase, normalizeSessionId } from '@/lib/supabase/sessions';
 
 function InstructorDashboardContent() {
   const searchParams = useSearchParams();
@@ -73,8 +74,9 @@ function InstructorDashboardContent() {
   });
 
   const getJoinUrl = (session: LabSession) => {
-    if (typeof window === 'undefined') return `/join/${session.sessionCode || session.id}`;
-    return `${window.location.origin}/join/${session.sessionCode || session.id}`;
+    const cleanId = normalizeSessionId(session.id || session.sessionCode);
+    if (typeof window === 'undefined') return `/join/${cleanId}`;
+    return `${window.location.origin}/join/${cleanId}`;
   };
 
   const handleCopyLink = (session: LabSession) => {
@@ -90,13 +92,37 @@ function InstructorDashboardContent() {
 
     setIsSubmitting(true);
     try {
+      // Standardize session ID format: clean timestamp ID without 'session-' prefix
+      const standardizedId = String(Date.now());
+      const payload = {
+        ...formData,
+        id: standardizedId,
+        sessionCode: standardizedId,
+        status: 'active',
+        isActive: true
+      };
+
       const res = await fetch('/api/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(formData)
+        body: JSON.stringify(payload)
       });
       const newSession = await res.json();
-      setCreatedSession(newSession);
+      const cleanSession: LabSession = {
+        ...newSession,
+        id: standardizedId,
+        sessionCode: standardizedId,
+        status: 'active',
+        isActive: true
+      };
+
+      // 1. Verify session is inserted into Supabase & log created session ID and status
+      console.log(`[Create Session Clicked] Created Session ID: ${standardizedId}`);
+      console.log(`[Create Session Status]: active`);
+
+      await insertSessionToSupabase(cleanSession);
+
+      setCreatedSession(cleanSession);
       loadSessions();
     } catch (err) {
       console.error('Failed to create session:', err);
