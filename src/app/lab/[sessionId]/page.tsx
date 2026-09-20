@@ -1,22 +1,33 @@
 'use client';
 
 import React, { useState, useEffect, useRef } from 'react';
-import { useParams, useSearchParams } from 'next/navigation';
+import { useParams, useSearchParams, useRouter } from 'next/navigation';
 import { useAuth } from '@/lib/context/AuthContext';
 import { getSocket } from '@/lib/socket/client';
-import { LabSession, Assignment, CodeFile, LiveStudentState } from '@/types';
-import { WorkspaceHeader } from '@/components/lab/WorkspaceHeader';
-import { FileExplorer } from '@/components/lab/FileExplorer';
-import { MonacoCodeEditor } from '@/components/lab/MonacoCodeEditor';
-import { TerminalConsole } from '@/components/lab/TerminalConsole';
-import { InstructionsPanel } from '@/components/lab/InstructionsPanel';
-import { HelpModal } from '@/components/lab/HelpModal';
-import { runCode } from '@/lib/runner';
-import { Terminal, User, Hash, ArrowRight, Loader2, AlertCircle } from 'lucide-react';
+import { LabSession, LabParticipant } from '@/types';
+import {
+  Monitor,
+  Radio,
+  Hand,
+  HelpCircle,
+  LogOut,
+  CheckCircle2,
+  AlertCircle,
+  Loader2,
+  User,
+  Hash,
+  ArrowRight,
+  Sparkles,
+  StopCircle,
+  Play,
+  Send,
+  X
+} from 'lucide-react';
 
-function StudentLabWorkspaceContent() {
+function StudentScreenShareContent() {
   const params = useParams();
   const searchParams = useSearchParams();
+  const router = useRouter();
   const sessionId = (params?.sessionId as string) || 'session-101';
   const { currentUser } = useAuth();
 
@@ -27,24 +38,18 @@ function StudentLabWorkspaceContent() {
   const [isJoining, setIsJoining] = useState<boolean>(false);
   const [joinError, setJoinError] = useState<string>('');
 
-  const [session, setSession] = useState<LabSession | undefined>(undefined);
-  const [assignment, setAssignment] = useState<Assignment | undefined>(undefined);
-  const [files, setFiles] = useState<CodeFile[]>([]);
-  const [activeFileId, setActiveFileId] = useState<string>('');
-  const [terminalOutput, setTerminalOutput] = useState<string>('Initializing lab workspace...\n');
-  const [isTerminalError, setIsTerminalError] = useState(false);
-  const [executionTime, setExecutionTime] = useState<number | undefined>(undefined);
-  const [isRunning, setIsRunning] = useState(false);
-  const [completedTasks, setCompletedTasks] = useState<string[]>([]);
-  const [progress, setProgress] = useState(0);
-  const [isHelpActive, setIsHelpActive] = useState(false);
-  const [isHelpModalOpen, setIsHelpModalOpen] = useState(false);
-  const [isSubmitted, setIsSubmitted] = useState(false);
-  const [isSyncing, setIsSyncing] = useState(false);
+  const [session, setSession] = useState<LabSession | null>(null);
+  const [isScreenSharing, setIsScreenSharing] = useState<boolean>(false);
+  const [isHandRaised, setIsHandRaised] = useState<boolean>(false);
+  const [isHelpModalOpen, setIsHelpModalOpen] = useState<boolean>(false);
+  const [helpMessage, setHelpMessage] = useState<string>('');
+  const [activeHelpTicket, setActiveHelpTicket] = useState<string | null>(null);
+  const [hasLeft, setHasLeft] = useState<boolean>(false);
 
-  const debounceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
 
-  // 1. Check Identity from URL or localStorage
+  // 1. Initial Identity Check
   useEffect(() => {
     const qName = searchParams.get('name');
     const qId = searchParams.get('studentId');
@@ -61,28 +66,19 @@ function StudentLabWorkspaceContent() {
     }
   }, [searchParams, currentUser]);
 
-  // 2. Fetch Session & Assignment
+  // 2. Fetch Session Info
   useEffect(() => {
     fetch(`/api/sessions/${sessionId}`)
       .then(res => res.json())
       .then(data => {
-        if (data.session) {
-          setSession(data.session);
-        }
-        if (data.assignment) {
-          setAssignment(data.assignment);
-          if (files.length === 0 && data.assignment.starterFiles?.length > 0) {
-            setFiles(data.assignment.starterFiles);
-            setActiveFileId(data.assignment.starterFiles[0]?.id || '');
-          }
-        }
+        if (data.session) setSession(data.session);
       })
-      .catch(err => console.error('Failed to load lab session info:', err));
-  }, [sessionId, files.length]);
+      .catch(err => console.error('Failed to load session details:', err));
+  }, [sessionId]);
 
-  // 3. Socket Connection & Presence (once identity is confirmed)
+  // 3. Socket Connection & Presence
   useEffect(() => {
-    if (!isIdentityConfirmed) return;
+    if (!isIdentityConfirmed || hasLeft) return;
 
     const socket = getSocket();
     const activeStudentUser = {
@@ -94,33 +90,42 @@ function StudentLabWorkspaceContent() {
 
     socket.emit('join_session', { sessionId, user: activeStudentUser });
 
-    // Listen for state sync updates
-    const handleStudentStateUpdated = (state: LiveStudentState) => {
-      if (state.studentId === activeStudentUser.id || state.studentRegistrationId === studentId) {
-        setIsHelpActive(!!state.helpRequest && state.helpRequest.status === 'pending');
-        setIsSubmitted(state.status === 'Submitted');
-        setCompletedTasks(state.completedTaskIds || []);
-        setProgress(state.progressPercentage);
+    // Listen for instructor lowering hand / resolving help
+    const handleParticipantUpdated = (updated: LabParticipant) => {
+      if (updated.studentRegistrationId === studentId || updated.studentId === activeStudentUser.id) {
+        setIsHandRaised(updated.isHandRaised);
+        if (!updated.isHandRaised) {
+          setActiveHelpTicket(null);
+        }
       }
     };
 
-    socket.on('student_state_updated', handleStudentStateUpdated);
+    socket.on('participant_updated', handleParticipantUpdated);
 
+    // Heartbeat
     const heartbeatInterval = setInterval(() => {
       socket.emit('student_heartbeat', {
         sessionId,
-        studentId: activeStudentUser.id,
-        status: isSubmitted ? 'Submitted' : 'Active'
+        studentId: activeStudentUser.id
       });
     }, 15000);
 
     return () => {
       clearInterval(heartbeatInterval);
-      socket.off('student_state_updated', handleStudentStateUpdated);
+      socket.off('participant_updated', handleParticipantUpdated);
     };
-  }, [sessionId, isIdentityConfirmed, studentName, studentId, currentUser, isSubmitted]);
+  }, [sessionId, isIdentityConfirmed, studentName, studentId, currentUser, hasLeft]);
 
-  // Handle Identity Confirmation Submit
+  // Clean up media stream on unmount
+  useEffect(() => {
+    return () => {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+      }
+    };
+  }, []);
+
+  // Confirm Identity / Enter
   const handleConfirmIdentity = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!studentName.trim() || !studentId.trim()) return;
@@ -140,202 +145,121 @@ function StudentLabWorkspaceContent() {
 
       const data = await res.json();
       if (!res.ok) {
-        throw new Error(data.error || 'Failed to join session');
-      }
-
-      if (data.student?.files && data.student.files.length > 0) {
-        setFiles(data.student.files);
-        setActiveFileId(data.student.files[0].id);
+        throw new Error(data.error || 'Failed to enter session');
       }
 
       localStorage.setItem('vlab_student_name', studentName.trim());
       localStorage.setItem('vlab_student_id', studentId.trim());
       setIsIdentityConfirmed(true);
     } catch (err: any) {
-      setJoinError(err.message || 'Failed to register student');
+      setJoinError(err.message || 'Error entering lab');
     } finally {
       setIsJoining(false);
     }
   };
 
-  const activeFile = files.find(f => f.id === activeFileId) || files[0];
-
-  // Code change sync
-  const handleCodeChange = (newContent: string) => {
-    if (!activeFile) return;
-
-    setFiles(prev =>
-      prev.map(f => (f.id === activeFile.id ? { ...f, content: newContent } : f))
-    );
-    setIsSyncing(true);
-
-    if (debounceTimerRef.current) {
-      clearTimeout(debounceTimerRef.current);
-    }
-
-    debounceTimerRef.current = setTimeout(() => {
-      const socket = getSocket();
-      socket.emit('student_code_change', {
-        sessionId,
-        studentId: studentId || currentUser.id,
-        fileId: activeFile.id,
-        content: newContent
-      });
-      setIsSyncing(false);
-    }, 300);
-  };
-
-  const handleCreateFile = (name: string) => {
-    const newFile: CodeFile = {
-      id: `file-${Date.now()}`,
-      name,
-      content: `# ${name}\n`,
-      language: name.endsWith('.js') ? 'javascript' : name.endsWith('.html') ? 'html' : 'python'
-    };
-    const updated = [...files, newFile];
-    setFiles(updated);
-    setActiveFileId(newFile.id);
-
-    const socket = getSocket();
-    socket.emit('student_files_update', {
-      sessionId,
-      studentId: studentId || currentUser.id,
-      files: updated,
-      activeFileId: newFile.id
-    });
-  };
-
-  const handleDeleteFile = (fileId: string) => {
-    if (files.length <= 1) return;
-    const updated = files.filter(f => f.id !== fileId);
-    setFiles(updated);
-    if (activeFileId === fileId) {
-      setActiveFileId(updated[0].id);
-    }
-
-    const socket = getSocket();
-    socket.emit('student_files_update', {
-      sessionId,
-      studentId: studentId || currentUser.id,
-      files: updated,
-      activeFileId: updated[0].id
-    });
-  };
-
-  const handleSelectFile = (fileId: string) => {
-    setActiveFileId(fileId);
-    const socket = getSocket();
-    socket.emit('student_files_update', {
-      sessionId,
-      studentId: studentId || currentUser.id,
-      files,
-      activeFileId: fileId
-    });
-  };
-
-  const handleRenameFile = (fileId: string, newName: string) => {
-    const updated = files.map(f => (f.id === fileId ? { ...f, name: newName } : f));
-    setFiles(updated);
-
-    const socket = getSocket();
-    socket.emit('student_files_update', {
-      sessionId,
-      studentId: studentId || currentUser.id,
-      files: updated,
-      activeFileId
-    });
-  };
-
-  // Run Code
-  const handleRunCode = async () => {
-    if (!activeFile || isRunning) return;
-    setIsRunning(true);
-    setTerminalOutput('Running program...\n');
-    setIsTerminalError(false);
-
+  // Start Screen Sharing via getDisplayMedia
+  const handleStartScreenShare = async () => {
     try {
-      const result = await runCode(
-        activeFile.language,
-        activeFile.content,
-        files,
-        activeFile.name
-      );
-      const outputText = result.stderr ? `${result.stdout}\n${result.stderr}` : result.stdout;
-      setTerminalOutput(outputText || 'Program finished with no output.');
-      setIsTerminalError(result.exitCode !== 0);
-      setExecutionTime(result.executionTimeMs);
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: {
+          displaySurface: 'monitor'
+        },
+        audio: false
+      });
+
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+      }
+      setIsScreenSharing(true);
 
       const socket = getSocket();
-      socket.emit('student_code_execution', {
+      socket.emit('student_screen_status', {
         sessionId,
         studentId: studentId || currentUser.id,
-        output: outputText,
-        status: result.exitCode === 0 ? 'success' : 'error',
-        durationMs: result.executionTimeMs
+        isScreenSharing: true
       });
+
+      // Handle user clicking "Stop Sharing" from browser native chrome banner
+      stream.getVideoTracks()[0].onended = () => {
+        handleStopScreenShare();
+      };
     } catch (err: any) {
-      const errMsg = `Execution error: ${err.message || String(err)}`;
-      setTerminalOutput(errMsg);
-      setIsTerminalError(true);
-
-      const socket = getSocket();
-      socket.emit('student_code_execution', {
-        sessionId,
-        studentId: studentId || currentUser.id,
-        output: errMsg,
-        status: 'error',
-        durationMs: 0
-      });
-    } finally {
-      setIsRunning(false);
+      console.warn('Screen share cancelled or not allowed:', err);
     }
   };
 
-  const handleTaskToggle = (taskId: string, completed: boolean) => {
+  // Stop Screen Sharing
+  const handleStopScreenShare = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+    setIsScreenSharing(false);
+
     const socket = getSocket();
-    socket.emit('student_task_toggle', {
+    socket.emit('student_screen_status', {
       sessionId,
       studentId: studentId || currentUser.id,
-      taskId,
-      completed
+      isScreenSharing: false
     });
   };
 
-  const handleSendHelpRequest = (message: string) => {
+  // Raise / Lower Hand Toggle
+  const handleToggleRaiseHand = () => {
     const socket = getSocket();
-    socket.emit('student_request_help', {
+    const studentUid = studentId || currentUser.id;
+
+    if (isHandRaised) {
+      socket.emit('student_lower_hand', { sessionId, studentId: studentUid });
+      setIsHandRaised(false);
+      setActiveHelpTicket(null);
+    } else {
+      socket.emit('student_raise_hand', { sessionId, studentId: studentUid });
+      setIsHandRaised(true);
+    }
+  };
+
+  // Submit Need Help Ticket
+  const handleSubmitHelp = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!helpMessage.trim()) return;
+
+    const socket = getSocket();
+    const studentUid = studentId || currentUser.id;
+    socket.emit('student_raise_hand', {
       sessionId,
-      studentId: studentId || currentUser.id,
-      message
+      studentId: studentUid,
+      message: helpMessage.trim()
     });
-    setIsHelpActive(true);
+
+    setIsHandRaised(true);
+    setActiveHelpTicket(helpMessage.trim());
     setIsHelpModalOpen(false);
+    setHelpMessage('');
   };
 
-  const handleCancelHelp = () => {
-    const socket = getSocket();
-    socket.emit('instructor_resolve_help', {
-      sessionId,
-      studentId: studentId || currentUser.id
-    });
-    setIsHelpActive(false);
-  };
-
-  const handleSubmitAssignment = () => {
-    const confirmed = window.confirm(
-      'Are you sure you want to submit your laboratory assignment? You can continue editing after submitting.'
-    );
+  // Leave Session
+  const handleLeaveLab = () => {
+    const confirmed = window.confirm('Are you sure you want to leave this computer lab session?');
     if (!confirmed) return;
 
+    handleStopScreenShare();
+
     const socket = getSocket();
-    socket.emit('student_submit_assignment', {
+    socket.emit('student_leave_lab', {
       sessionId,
       studentId: studentId || currentUser.id
     });
-    setIsSubmitted(true);
+
+    setHasLeft(true);
   };
 
-  // If student identity is not confirmed yet, render the clean gate modal
+  // Access Gate Modal if student hasn't entered Name and ID yet
   if (!isIdentityConfirmed) {
     return (
       <div className="min-h-[calc(100vh-3.5rem)] bg-[#0d1117] text-gray-100 flex items-center justify-center p-4">
@@ -343,16 +267,16 @@ function StudentLabWorkspaceContent() {
           <div className="p-6 border-b border-gray-800 bg-gray-900/40">
             <div className="flex items-center space-x-2 text-xs font-semibold text-emerald-400 uppercase tracking-wider mb-2">
               <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-              <span>Student Lab Access</span>
+              <span>Computer Lab Entry</span>
             </div>
             <h1 className="text-xl font-bold text-white mb-1">
-              {session?.sessionTitle || session?.name || 'Programming Lab'}
+              {session?.sessionTitle || session?.groupName || 'Virtual Computer Lab'}
             </h1>
             <div className="flex items-center space-x-3 text-xs text-gray-400">
               <span className="bg-gray-800 px-2 py-0.5 rounded font-mono text-gray-300">
-                {session?.groupCode || 'GRP-1'}
+                {session?.groupCode || 'LAB-1'}
               </span>
-              <span>{session?.groupName || 'Section Lab'}</span>
+              <span>{session?.groupName || 'Computer Lab Room'}</span>
             </div>
           </div>
 
@@ -383,7 +307,7 @@ function StudentLabWorkspaceContent() {
 
             <div>
               <label className="block text-xs font-semibold text-gray-300 mb-1.5">
-                Student ID / Registration Number <span className="text-rose-400">*</span>
+                Student ID / Computer Station Number <span className="text-rose-400">*</span>
               </label>
               <div className="relative">
                 <Hash className="w-4 h-4 text-gray-400 absolute left-3 top-3" />
@@ -411,7 +335,7 @@ function StudentLabWorkspaceContent() {
                   </>
                 ) : (
                   <>
-                    <span>Enter Coding Workspace</span>
+                    <span>Enter Computer Lab</span>
                     <ArrowRight className="w-4 h-4" />
                   </>
                 )}
@@ -420,7 +344,35 @@ function StudentLabWorkspaceContent() {
           </form>
 
           <div className="px-6 py-3 bg-[#0d1117]/60 border-t border-gray-800 text-center text-[11px] text-gray-500">
-            Instructor will monitor your code & executions in real time
+            You will share your desktop screen with the instructor during this session
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // If student clicked Leave Lab
+  if (hasLeft) {
+    return (
+      <div className="min-h-[calc(100vh-3.5rem)] bg-[#0d1117] text-gray-100 flex items-center justify-center p-4">
+        <div className="w-full max-w-md bg-[#161b22] border border-gray-800 rounded-xl p-8 text-center space-y-4 shadow-xl">
+          <div className="w-12 h-12 rounded-full bg-gray-800 text-gray-400 mx-auto flex items-center justify-center">
+            <LogOut className="w-6 h-6" />
+          </div>
+          <h2 className="text-xl font-bold text-white">You Have Left the Lab Session</h2>
+          <p className="text-xs text-gray-400">
+            Your departure time has been recorded in the attendance roster. Your screen sharing has been terminated.
+          </p>
+          <div className="pt-2">
+            <button
+              onClick={() => {
+                setHasLeft(false);
+                setIsScreenSharing(false);
+              }}
+              className="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded-lg text-xs font-semibold transition"
+            >
+              Rejoin Session
+            </button>
           </div>
         </div>
       </div>
@@ -428,97 +380,237 @@ function StudentLabWorkspaceContent() {
   }
 
   return (
-    <div className="flex-1 flex flex-col h-[calc(100vh-3.5rem)] bg-[#0d1117] text-white overflow-hidden">
-      {/* Workspace Header */}
-      <WorkspaceHeader
-        session={session}
-        assignment={assignment}
-        isRunning={isRunning}
-        onRunCode={handleRunCode}
-        onSubmitAssignment={handleSubmitAssignment}
-        onRequestHelp={() => {
-          if (isHelpActive) handleCancelHelp();
-          else setIsHelpModalOpen(true);
-        }}
-        isHelpActive={isHelpActive}
-        isSubmitted={isSubmitted}
-      />
-
-      {/* Main 3-Column IDE Layout */}
-      <div className="flex-1 flex min-h-0">
-        {/* Left Col: File Explorer */}
-        <div className="w-56 bg-[#161b22] border-r border-gray-800 flex flex-col shrink-0">
-          <FileExplorer
-            files={files}
-            activeFileId={activeFileId}
-            onSelectFile={handleSelectFile}
-            onCreateFile={handleCreateFile}
-            onDeleteFile={handleDeleteFile}
-            onRenameFile={handleRenameFile}
-          />
+    <div className="min-h-[calc(100vh-3.5rem)] bg-[#0d1117] text-gray-100 flex flex-col">
+      {/* Top Station Header */}
+      <header className="bg-[#161b22] border-b border-gray-800 px-6 py-3 flex flex-wrap items-center justify-between gap-4">
+        <div className="flex items-center space-x-3">
+          <div className="w-8 h-8 rounded-lg bg-emerald-600 flex items-center justify-center text-white">
+            <Monitor className="w-4 h-4" />
+          </div>
+          <div>
+            <div className="flex items-center space-x-2">
+              <span className="bg-gray-800 px-2 py-0.5 rounded font-mono text-[11px] text-gray-200 border border-gray-700">
+                {session?.groupCode || 'LAB-1'}
+              </span>
+              <h1 className="text-sm font-bold text-white">
+                {session?.sessionTitle || session?.groupName || 'Classroom Computer Lab'}
+              </h1>
+            </div>
+            <div className="text-[11px] text-gray-400 mt-0.5">
+              Station: <strong className="text-gray-200">{studentName}</strong> (ID: {studentId})
+            </div>
+          </div>
         </div>
 
-        {/* Center Col: Monaco Editor */}
-        <div className="flex-1 flex flex-col min-w-0 bg-[#1e1e1e]">
-          {activeFile ? (
-            <MonacoCodeEditor
-              file={activeFile}
-              value={activeFile.content}
-              isReadOnly={isSubmitted}
-              isSyncing={isSyncing}
-              onChange={handleCodeChange}
-            />
+        {/* Live Status Pill & Quick Controls */}
+        <div className="flex items-center space-x-3">
+          {isScreenSharing ? (
+            <div className="flex items-center space-x-2 px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 text-xs font-semibold">
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+              <span>Screen Sharing Active</span>
+            </div>
           ) : (
-            <div className="flex-1 flex items-center justify-center text-gray-500 text-sm">
-              No open file. Create or select a file from the explorer.
+            <div className="flex items-center space-x-2 px-3 py-1 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/30 text-xs font-semibold">
+              <span className="w-2 h-2 rounded-full bg-amber-400" />
+              <span>Screen Not Shared</span>
             </div>
           )}
-        </div>
 
-        {/* Right Col: Instructions & Terminal */}
-        <div className="w-96 bg-[#161b22] border-l border-gray-800 flex flex-col shrink-0">
-          {/* Top Half: Instructions */}
-          <div className="h-1/2 border-b border-gray-800 flex flex-col min-h-0">
-            <InstructionsPanel
-              assignment={assignment}
-              completedTaskIds={completedTasks}
-              progressPercentage={progress}
-              onToggleTask={handleTaskToggle}
-            />
+          <button
+            onClick={handleLeaveLab}
+            className="px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-rose-900/40 hover:text-rose-300 text-gray-400 border border-gray-700 text-xs flex items-center space-x-1.5 transition"
+          >
+            <LogOut className="w-3.5 h-3.5" />
+            <span>Leave Lab</span>
+          </button>
+        </div>
+      </header>
+
+      {/* Hand Raised Notification Banner if active */}
+      {isHandRaised && (
+        <div className="bg-amber-950/40 border-b border-amber-500/30 px-6 py-2.5 flex items-center justify-between animate-in fade-in">
+          <div className="flex items-center space-x-2 text-xs text-amber-200">
+            <Hand className="w-4 h-4 text-amber-400 animate-bounce" />
+            <span>
+              <strong>Your hand is raised.</strong> The instructor has been notified and will assist you shortly.
+              {activeHelpTicket && ` ("${activeHelpTicket}")`}
+            </span>
+          </div>
+          <button
+            onClick={handleToggleRaiseHand}
+            className="text-xs font-semibold bg-amber-600 hover:bg-amber-500 text-white px-3 py-1 rounded-md transition"
+          >
+            Lower Hand
+          </button>
+        </div>
+      )}
+
+      {/* Main Workspace Stage */}
+      <div className="flex-1 p-6 max-w-6xl mx-auto w-full flex flex-col space-y-6">
+        {/* Screen Sharing Broadcast Container */}
+        <div className="flex-1 bg-[#161b22] border border-gray-800 rounded-2xl shadow-xl overflow-hidden flex flex-col min-h-[420px]">
+          {/* Container Header */}
+          <div className="px-5 py-3 border-b border-gray-800 bg-[#12161f] flex items-center justify-between text-xs text-gray-400">
+            <div className="flex items-center space-x-2">
+              <Radio className="w-3.5 h-3.5 text-emerald-400" />
+              <span className="font-semibold text-gray-200">Desktop Screen Broadcast</span>
+            </div>
+            <span className="text-[11px] text-gray-500">
+              {isScreenSharing ? 'Transmitting full display live via WebRTC' : 'Ready to transmit'}
+            </span>
           </div>
 
-          {/* Bottom Half: Terminal Console */}
-          <div className="h-1/2 flex flex-col min-h-0">
-            <TerminalConsole
-              output={terminalOutput}
-              isError={isTerminalError}
-              executionTimeMs={executionTime}
-              onClear={() => setTerminalOutput('')}
-              files={files}
-              activeLanguage={activeFile?.language}
-            />
+          {/* Broadcast Stage View */}
+          <div className="flex-1 flex items-center justify-center p-4 bg-[#0a0d12] relative">
+            {isScreenSharing ? (
+              <div className="w-full h-full flex flex-col items-center justify-center relative">
+                <video
+                  ref={videoRef}
+                  autoPlay
+                  playsInline
+                  muted
+                  className="w-full max-h-[500px] object-contain rounded-lg shadow-2xl border border-gray-800"
+                />
+                <div className="absolute top-3 right-3 bg-black/80 backdrop-blur-md px-3 py-1 rounded-full border border-emerald-500/40 text-[11px] text-emerald-300 font-semibold flex items-center space-x-1.5 shadow-lg">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                  <span>Live to Instructor</span>
+                </div>
+              </div>
+            ) : (
+              <div className="text-center p-8 max-w-md space-y-4">
+                <div className="w-16 h-16 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 flex items-center justify-center mx-auto shadow-lg shadow-emerald-500/5">
+                  <Monitor className="w-8 h-8" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-white">Share Your Desktop Screen</h3>
+                  <p className="text-xs text-gray-400 mt-1 leading-relaxed">
+                    This computer lab requires real-time screen sharing. Your instructor will monitor your desktop alongside other participants during class exercises.
+                  </p>
+                </div>
+                <div className="pt-2">
+                  <button
+                    onClick={handleStartScreenShare}
+                    className="bg-emerald-600 hover:bg-emerald-500 text-white font-semibold px-6 py-3 rounded-xl text-sm flex items-center space-x-2 mx-auto shadow-lg shadow-emerald-900/30 transition transform hover:scale-[1.02]"
+                  >
+                    <Play className="w-4 h-4 fill-current" />
+                    <span>Share Entire Screen</span>
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Action Controls Bar */}
+        <div className="bg-[#161b22] border border-gray-800 rounded-xl p-4 flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center space-x-3">
+            {/* Screen Share Action */}
+            {isScreenSharing ? (
+              <button
+                onClick={handleStopScreenShare}
+                className="bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 border border-rose-500/40 font-semibold px-4 py-2 rounded-lg text-xs flex items-center space-x-2 transition"
+              >
+                <StopCircle className="w-4 h-4 text-rose-400" />
+                <span>Stop Screen Sharing</span>
+              </button>
+            ) : (
+              <button
+                onClick={handleStartScreenShare}
+                className="bg-emerald-600 hover:bg-emerald-500 text-white font-semibold px-4 py-2 rounded-lg text-xs flex items-center space-x-2 transition shadow-sm"
+              >
+                <Play className="w-4 h-4 fill-current" />
+                <span>Start Sharing Desktop</span>
+              </button>
+            )}
+          </div>
+
+          <div className="flex items-center space-x-3">
+            {/* Raise / Lower Hand */}
+            <button
+              onClick={handleToggleRaiseHand}
+              className={`px-4 py-2 rounded-lg text-xs font-semibold flex items-center space-x-2 transition shadow-xs ${
+                isHandRaised
+                  ? 'bg-amber-500 text-gray-950 shadow-md shadow-amber-500/20 animate-pulse'
+                  : 'bg-[#0d1117] hover:bg-gray-800 border border-gray-700 text-amber-300'
+              }`}
+            >
+              <Hand className="w-4 h-4" />
+              <span>{isHandRaised ? 'Hand Raised (Click to Lower)' : 'Raise Hand'}</span>
+            </button>
+
+            {/* Need Help Button */}
+            <button
+              onClick={() => setIsHelpModalOpen(true)}
+              className="bg-[#0d1117] hover:bg-gray-800 border border-gray-700 text-gray-200 px-4 py-2 rounded-lg text-xs font-semibold flex items-center space-x-2 transition"
+            >
+              <HelpCircle className="w-4 h-4 text-cyan-400" />
+              <span>Need Help</span>
+            </button>
           </div>
         </div>
       </div>
 
-      {/* Help Request Modal */}
+      {/* Need Help Modal */}
       {isHelpModalOpen && (
-        <HelpModal
-          isOpen={isHelpModalOpen}
-          onClose={() => setIsHelpModalOpen(false)}
-          onSubmit={handleSendHelpRequest}
-          isHelpActive={isHelpActive}
-          onCancelRequest={handleCancelHelp}
-        />
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-xs p-4 animate-in fade-in duration-150">
+          <div className="bg-[#161b22] border border-gray-700 rounded-xl w-full max-w-md shadow-2xl overflow-hidden">
+            <div className="px-5 py-4 border-b border-gray-800 flex items-center justify-between bg-gray-900/40">
+              <div className="flex items-center space-x-2 text-white font-bold text-sm">
+                <HelpCircle className="w-4 h-4 text-cyan-400" />
+                <span>Ask Instructor for Assistance</span>
+              </div>
+              <button
+                onClick={() => setIsHelpModalOpen(false)}
+                className="text-gray-400 hover:text-white transition"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSubmitHelp} className="p-5 space-y-4">
+              <div>
+                <label className="block text-xs font-semibold text-gray-300 mb-1.5">
+                  Describe what you need help with:
+                </label>
+                <textarea
+                  required
+                  rows={3}
+                  value={helpMessage}
+                  onChange={e => setHelpMessage(e.target.value)}
+                  placeholder="e.g. Could you look at my terminal? Encountering a segmentation fault."
+                  className="w-full bg-[#0d1117] border border-gray-700 rounded-lg p-3 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-cyan-500"
+                />
+              </div>
+
+              <div className="flex items-center justify-end space-x-3 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setIsHelpModalOpen(false)}
+                  className="px-3 py-1.5 rounded-lg bg-gray-800 text-gray-300 text-xs font-medium hover:bg-gray-700 transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={!helpMessage.trim()}
+                  className="px-4 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white text-xs font-semibold flex items-center space-x-1.5 transition"
+                >
+                  <Send className="w-3.5 h-3.5" />
+                  <span>Send to Instructor</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
       )}
     </div>
   );
 }
 
-export default function StudentLabWorkspacePage() {
+export default function StudentScreenSharePage() {
   return (
-    <React.Suspense fallback={<div className="h-[calc(100vh-3.5rem)] bg-[#0d1117] flex items-center justify-center text-xs text-gray-400">Loading Lab Workspace...</div>}>
-      <StudentLabWorkspaceContent />
+    <React.Suspense fallback={<div className="min-h-[calc(100vh-3.5rem)] bg-[#0d1117] flex items-center justify-center text-xs text-gray-400">Loading Computer Lab Station...</div>}>
+      <StudentScreenShareContent />
     </React.Suspense>
   );
 }

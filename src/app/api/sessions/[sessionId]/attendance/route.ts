@@ -13,28 +13,30 @@ export async function GET(
     const headers = [
       'Session Name',
       'Student Name',
+      'Student ID',
       'Student Email',
       'Join Time',
-      'Status',
+      'Leave Time',
       'Duration (Mins)',
-      'Progress %',
-      'Tasks Done',
+      'Screen Sharing Status',
+      'Screen Share Mins',
+      'Hands Raised',
       'Help Requested',
-      'Performance Tag',
-      'Notes'
+      'Attendance Status'
     ];
     const rows = report.map(r => [
       `"${r.sessionName}"`,
       `"${r.studentName}"`,
+      `"${r.studentId}"`,
       `"${r.studentEmail}"`,
       `"${r.joinTime}"`,
-      `"${r.status}"`,
+      `"${r.leaveTime}"`,
       r.durationMinutes,
-      `${r.progressPercentage}%`,
-      r.tasksCompleted,
+      `"${r.screenSharingStatus}"`,
+      r.screenSharingDurationMinutes,
+      r.handsRaisedCount,
       `"${r.helpRequested}"`,
-      `"${r.instructorTag}"`,
-      `"${r.instructorNotes.replace(/"/g, '""')}"`
+      `"${r.notes}"`
     ]);
 
     const csvContent = [headers.join(','), ...rows.map(row => row.join(','))].join('\n');

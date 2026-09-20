@@ -5,6 +5,6 @@ export async function GET(
   req: NextRequest,
   { params }: { params: { sessionId: string } }
 ) {
-  const students = dbStore.getStudentStatesForSession(params.sessionId);
-  return NextResponse.json(students);
+  const participants = dbStore.getParticipants(params.sessionId);
+  return NextResponse.json(participants);
 }

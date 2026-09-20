@@ -4,7 +4,6 @@ import next from 'next';
 import { Server as SocketIOServer } from 'socket.io';
 import { registerSocketHandlers } from './src/lib/socket/handlers';
 import { dbStore } from './src/lib/db/store';
-import { startStudentSimulation, stopStudentSimulation, isSimulationActive } from './src/lib/simulation/studentSim';
 
 const dev = process.env.NODE_ENV !== 'production';
 const port = parseInt(process.env.PORT || '3000', 10);
@@ -40,20 +39,6 @@ async function bootstrap() {
     res.json(dbStore.getUsers());
   });
 
-  // Get courses
-  app.get('/api/courses', (req, res) => {
-    res.json(dbStore.getCourses());
-  });
-
-  // Get assignments
-  app.get('/api/assignments', (req, res) => {
-    res.json(dbStore.getAssignments());
-  });
-
-  app.post('/api/assignments', (req, res) => {
-    const newAssignment = dbStore.createAssignment(req.body);
-    res.status(201).json(newAssignment);
-  });
 
   // Get sessions
   app.get('/api/sessions', (req, res) => {
@@ -70,20 +55,13 @@ async function bootstrap() {
     if (!session) {
       return res.status(404).json({ error: 'Session not found' });
     }
-    const assignment = session.assignmentId ? dbStore.getAssignment(session.assignmentId) : undefined;
-    const course = session.courseId ? dbStore.getCourses().find(c => c.id === session.courseId) : undefined;
-    res.json({ session, assignment, course });
+    const participants = dbStore.getParticipants(req.params.id);
+    res.json({ session, participants });
   });
 
-  // Get live students for a session
+  // Get live participants for a session
   app.get('/api/sessions/:id/students', (req, res) => {
-    res.json(dbStore.getStudentStatesForSession(req.params.id));
-  });
-
-  // Get student activity timeline logs
-  app.get('/api/sessions/:id/activity', (req, res) => {
-    const studentId = req.query.studentId as string | undefined;
-    res.json(dbStore.getActivityLogs(req.params.id, studentId));
+    res.json(dbStore.getParticipants(req.params.id));
   });
 
   // Attendance & export API
@@ -92,19 +70,33 @@ async function bootstrap() {
     const report = dbStore.getAttendanceReport(req.params.id);
 
     if (format === 'csv') {
-      const headers = ['Session Name', 'Student Name', 'Student Email', 'Join Time', 'Status', 'Duration (Mins)', 'Progress %', 'Tasks Done', 'Help Requested', 'Performance Tag', 'Notes'];
+      const headers = [
+        'Session Name',
+        'Student Name',
+        'Student ID',
+        'Student Email',
+        'Join Time',
+        'Leave Time',
+        'Duration (Mins)',
+        'Screen Sharing Status',
+        'Screen Share Mins',
+        'Hands Raised',
+        'Help Requested',
+        'Attendance Status'
+      ];
       const rows = report.map(r => [
         `"${r.sessionName}"`,
         `"${r.studentName}"`,
+        `"${r.studentId}"`,
         `"${r.studentEmail}"`,
         `"${r.joinTime}"`,
-        `"${r.status}"`,
+        `"${r.leaveTime}"`,
         r.durationMinutes,
-        `${r.progressPercentage}%`,
-        r.tasksCompleted,
+        `"${r.screenSharingStatus}"`,
+        r.screenSharingDurationMinutes,
+        r.handsRaisedCount,
         `"${r.helpRequested}"`,
-        `"${r.instructorTag}"`,
-        `"${r.instructorNotes.replace(/"/g, '""')}"`
+        `"${r.notes}"`
       ]);
 
       const csvContent = [headers.join(','), ...rows.map(row => row.join(','))].join('\n');
@@ -116,47 +108,9 @@ async function bootstrap() {
     res.json(report);
   });
 
-  // Simulation Toggle (for live interactive instructor demo)
-  app.get('/api/simulation/status', (req, res) => {
-    res.json({ active: isSimulationActive() });
-  });
-
-  app.post('/api/simulation/toggle', (req, res) => {
-    const { sessionId } = req.body;
-    if (isSimulationActive()) {
-      stopStudentSimulation();
-      res.json({ active: false, message: 'Simulation stopped' });
-    } else {
-      startStudentSimulation(io, sessionId || 'session-101');
-      res.json({ active: true, message: 'Live multi-student simulation started' });
-    }
-  });
-
-  // Analytics Metrics
-  app.get('/api/analytics', (req, res) => {
-    const students = dbStore.getStudentStatesForSession('session-101');
-    const totalStudents = students.length;
-    const activeCount = students.filter(s => s.status === 'Active').length;
-    const submittedCount = students.filter(s => s.status === 'Submitted').length;
-    const helpRequestsCount = students.filter(s => s.helpRequest !== null).length;
-    const avgProgress = totalStudents > 0
-      ? Math.round(students.reduce((acc, s) => acc + s.progressPercentage, 0) / totalStudents)
-      : 0;
-    const avgDurationMinutes = totalStudents > 0
-      ? Math.round(students.reduce((acc, s) => acc + s.timeInLabSeconds, 0) / totalStudents / 60)
-      : 0;
-
-    res.json({
-      attendanceRate: 92, // %
-      labCompletionRate: Math.round((submittedCount / (totalStudents || 1)) * 100),
-      averageEngagementScore: 88, // %
-      averageTimeInLabMinutes: avgDurationMinutes,
-      activeHelpRequests: helpRequestsCount,
-      submissionRate: Math.round((submittedCount / (totalStudents || 1)) * 100),
-      averageProgress: avgProgress,
-      totalSessionsConducted: 24,
-      totalEnrolledStudents: 142
-    });
+  // Health check
+  app.get('/api/health', (req, res) => {
+    res.json({ status: 'ok', uptime: process.uptime(), timestamp: new Date().toISOString() });
   });
 
   // Let Next.js handle all remaining frontend routes

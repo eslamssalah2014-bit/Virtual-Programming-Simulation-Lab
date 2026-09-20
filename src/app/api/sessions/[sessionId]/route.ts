@@ -9,8 +9,7 @@ export async function GET(
   if (!session) {
     return NextResponse.json({ error: 'Session not found' }, { status: 404 });
   }
-  const assignment = session.assignmentId ? dbStore.getAssignment(session.assignmentId) : undefined;
-  const course = session.courseId ? dbStore.getCourses().find(c => c.id === session.courseId) : undefined;
+  const participants = dbStore.getParticipants(params.sessionId);
 
-  return NextResponse.json({ session, assignment, course });
+  return NextResponse.json({ session, participants });
 }

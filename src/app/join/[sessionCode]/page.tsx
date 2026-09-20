@@ -103,19 +103,19 @@ export default function JoinSessionPage() {
 
           {session ? (
             <div>
-              <h1 className="text-xl font-bold text-white mb-1">{session.sessionTitle || session.name}</h1>
+              <h1 className="text-xl font-bold text-white mb-1">{session.sessionTitle}</h1>
               <div className="flex items-center space-x-3 text-xs text-gray-400">
                 <span className="bg-gray-800 px-2 py-0.5 rounded font-mono text-gray-300">
                   {session.groupCode}
                 </span>
                 <span>Session #{session.sessionNumber}</span>
-                <span className="capitalize text-emerald-400">
-                  {session.language}
+                <span className="text-emerald-400 font-medium">
+                  {session.groupName}
                 </span>
               </div>
             </div>
           ) : (
-            <h1 className="text-lg font-bold text-white">Join Lab Session</h1>
+            <h1 className="text-lg font-bold text-white">Join Computer Lab Session</h1>
           )}
         </div>
 
@@ -175,7 +175,7 @@ export default function JoinSessionPage() {
                 </>
               ) : (
                 <>
-                  <span>Enter Coding Workspace</span>
+                  <span>Enter Computer Lab & Share Screen</span>
                   <ArrowRight className="w-4 h-4" />
                 </>
               )}
@@ -184,7 +184,7 @@ export default function JoinSessionPage() {
         </form>
 
         <div className="px-6 py-3 bg-[#0d1117]/60 border-t border-gray-800 text-center text-[11px] text-gray-500">
-          Internal Educational Laboratory • Direct Workspace Mirror
+          Virtual Computer Lab Monitoring • Real-time Desktop Sharing
         </div>
       </div>
     </div>
