@@ -24,18 +24,17 @@ import {
   ChevronRight,
   AlertTriangle,
   Search,
-  Activity,
   Video
 } from 'lucide-react';
 
 function InstructorLiveSessionContent() {
   const params = useParams();
-  const sessionId = (params?.sessionId as string) || 'session-101';
+  const rawSessionId = (params?.sessionId as string) || 'session-101';
 
   const [session, setSession] = useState<LabSession | null>(null);
+  const [canonicalRoomId, setCanonicalRoomId] = useState<string>(rawSessionId);
   const [participants, setParticipants] = useState<LabParticipant[]>([]);
   const [focusedParticipant, setFocusedParticipant] = useState<LabParticipant | null>(null);
-  const [activeTab, setActiveTab] = useState<'screens' | 'attendance'>('screens');
   const [statusFilter, setStatusFilter] = useState<'all' | 'sharing' | 'hands'>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [copied, setCopied] = useState<boolean>(false);
@@ -46,6 +45,7 @@ function InstructorLiveSessionContent() {
   const [peerStates, setPeerStates] = useState<Record<string, {
     connectionState: string;
     iceState: string;
+    signalingState: string;
     streamId?: string;
     trackCount: number;
   }>>({});
@@ -59,39 +59,49 @@ function InstructorLiveSessionContent() {
     setLogs(prev => [entry, ...prev.slice(0, 249)]);
   };
 
-  // 1. Fetch initial session and participants data
+  // 1. Fetch Session Info & Resolve Canonical Room ID
   useEffect(() => {
-    fetch(`/api/sessions/${sessionId}`)
+    fetch(`/api/sessions/${rawSessionId}`)
       .then(res => res.json())
       .then(data => {
-        if (data.session) setSession(data.session);
+        if (data.session) {
+          setSession(data.session);
+          setCanonicalRoomId(data.session.id); // Matches student room exactly!
+        }
         if (Array.isArray(data.participants)) setParticipants(data.participants);
       })
       .catch(err => console.error('Failed to load session:', err));
-  }, [sessionId]);
+  }, [rawSessionId]);
 
-  // 2. Setup Unified WebRTC Signaling for Instructor
+  // 2. Setup Unified WebRTC Signaling Channel
   useEffect(() => {
-    const signaling = new UnifiedSignalingClient(sessionId, 'instructor', 'instructor', addLog);
+    const signaling = new UnifiedSignalingClient(
+      rawSessionId,
+      canonicalRoomId,
+      'instructor',
+      'instructor',
+      addLog
+    );
     signalingRef.current = signaling;
 
     signaling.log(
-      `[Instructor Connected] Monitoring station ready for session: ${sessionId}`,
+      `Instructor Station Connected | Raw: ${rawSessionId} | Canonical Room: ${canonicalRoomId} | Channel: ${signaling.channelName}`,
       'success',
       'signaling'
     );
 
-    // Notify presence
+    // Notify room presence
     signaling.send('join_session', 'all', {
-      sessionId,
+      sessionId: canonicalRoomId,
+      rawSessionId,
       user: { id: 'instructor', role: 'instructor' }
     });
 
-    // Handle student joining
+    // Handle student joined
     signaling.on('join_session', (data: any) => {
       if (data.studentId && data.studentId !== 'instructor') {
         signaling.log(
-          `[Student Connected] Student joined lab: ${data.studentName || 'Student'} (${data.studentId})`,
+          `[Student Connected] Student joined room: ${data.studentName || 'Student'} (${data.studentId})`,
           'info',
           'signaling'
         );
@@ -120,28 +130,34 @@ function InstructorLiveSessionContent() {
       }
     });
 
-    // Handle incoming WebRTC Offer from Student
+    // 4. Offer received milestone handler
     signaling.on('webrtc_offer', async (data: any) => {
       const { studentId, studentName, studentRegistrationId, offer } = data;
       if (!studentId || !offer) return;
 
       signaling.log(
-        `[Offer Received] Received WebRTC SDP offer from student: ${studentName || studentId}`,
+        `[4. Offer received] Received WebRTC offer from student: ${studentName || studentId}`,
         'success',
         'signaling',
         { sdpType: offer.type }
       );
 
-      // Close previous connection for this student if one exists
+      // Close previous connection if exists
       const existingPc = peerConnectionsRef.current.get(studentId);
       if (existingPc) {
-        signaling.log(`Closing previous RTCPeerConnection for student ${studentId}`, 'info', 'webrtc');
+        signaling.log(`Closing prior RTCPeerConnection for student ${studentId}`, 'info', 'webrtc');
         existingPc.close();
       }
 
-      // Create new RTCPeerConnection
+      // 1. PeerConnection created milestone for student peer
       const pc = new RTCPeerConnection(RTC_CONFIGURATION);
       peerConnectionsRef.current.set(studentId, pc);
+
+      signaling.log(
+        `[1. PeerConnection created] RTCPeerConnection created for student ${studentName || studentId}`,
+        'success',
+        'webrtc'
+      );
 
       const updatePeerInfo = () => {
         setPeerStates(prev => ({
@@ -149,42 +165,45 @@ function InstructorLiveSessionContent() {
           [studentId]: {
             connectionState: pc.connectionState,
             iceState: pc.iceConnectionState,
+            signalingState: pc.signalingState,
             streamId: (pc as any).getRemoteStreams?.()[0]?.id || `stream-${studentId}`,
             trackCount: pc.getReceivers().length
           }
         }));
       };
 
+      // 11. Connection state changes milestone
       pc.onconnectionstatechange = () => {
         const state = pc.connectionState;
         updatePeerInfo();
         signaling.log(
-          `[WebRTC Connection State Changed] Student ${studentName || studentId}: ${state}`,
+          `[11. Connection state changes] Student ${studentName || studentId}: connectionState transitioned to -> ${state}`,
           state === 'connected' ? 'success' : state === 'failed' ? 'error' : 'info',
           'webrtc'
         );
       };
 
+      // 10. ICE connection state changes milestone
       pc.oniceconnectionstatechange = () => {
         const state = pc.iceConnectionState;
         updatePeerInfo();
         signaling.log(
-          `[ICE Connection State Changed] Student ${studentName || studentId}: ${state}`,
+          `[10. ICE connection state changes] Student ${studentName || studentId}: iceConnectionState transitioned to -> ${state}`,
           state === 'connected' || state === 'completed' ? 'success' : state === 'failed' ? 'error' : 'info',
           'ice'
         );
       };
 
-      // Send local ICE candidate to student
+      // 8. ICE candidate generated milestone
       pc.onicecandidate = (event) => {
         if (event.candidate) {
           signaling.log(
-            `[ICE Candidate Exchange] Generated candidate for student ${studentName || studentId}, sending back`,
+            `[8. ICE candidate generated] Generated instructor candidate for student ${studentName || studentId}, dispatching`,
             'info',
             'ice'
           );
           signaling.send('webrtc_ice_candidate', studentId, {
-            sessionId,
+            sessionId: canonicalRoomId,
             studentId,
             targetId: studentId,
             candidate: event.candidate,
@@ -193,7 +212,7 @@ function InstructorLiveSessionContent() {
         }
       };
 
-      // Critical: ontrack receives the remote screen video stream from the student!
+      // Critical ontrack handler: receives the remote desktop stream!
       pc.ontrack = (event) => {
         const remoteStream = event.streams[0] || new MediaStream([event.track]);
         signaling.log(
@@ -207,7 +226,6 @@ function InstructorLiveSessionContent() {
           [studentId]: remoteStream
         }));
 
-        // Update participant active status
         setParticipants(prev =>
           prev.map(p => {
             if (p.studentId === studentId || p.studentRegistrationId === studentRegistrationId) {
@@ -215,7 +233,7 @@ function InstructorLiveSessionContent() {
                 ...p,
                 isScreenSharing: true,
                 status: 'Active',
-                lastActivity: 'Sharing desktop live'
+                lastActivity: 'Streaming live desktop'
               };
             }
             return p;
@@ -230,25 +248,34 @@ function InstructorLiveSessionContent() {
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
         signaling.log(`[Remote Description Set] Applied offer from student ${studentName || studentId}`, 'info', 'webrtc');
 
-        // Create WebRTC Answer
+        // 5. Answer created milestone
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        signaling.log(`[Answer Created] Created WebRTC answer for student ${studentName || studentId}`, 'success', 'webrtc');
+        updatePeerInfo();
+        signaling.log(
+          `[5. Answer created] Created SDP answer for student ${studentName || studentId} (type: ${answer.type})`,
+          'success',
+          'webrtc'
+        );
 
-        // Send Answer back to Student
+        // 6. Answer sent milestone
         signaling.send('webrtc_answer', studentId, {
-          sessionId,
+          sessionId: canonicalRoomId,
           studentId,
           targetId: studentId,
           answer
         });
-        signaling.log(`[Answer Sent] Dispatched WebRTC answer to student ${studentName || studentId}`, 'success', 'signaling');
+        signaling.log(
+          `[6. Answer sent] Dispatched WebRTC answer to student ${studentName || studentId} on channel ${signaling.channelName}`,
+          'success',
+          'signaling'
+        );
       } catch (err: any) {
         signaling.log(`[WebRTC Error] Failed processing offer from student ${studentId}: ${err.message}`, 'error', 'webrtc');
       }
     });
 
-    // Handle incoming ICE candidates from Student
+    // 9. ICE candidate received milestone
     signaling.on('webrtc_ice_candidate', async (data: any) => {
       if (data.fromRole === 'instructor') return;
       const { studentId, candidate } = data;
@@ -259,7 +286,7 @@ function InstructorLiveSessionContent() {
         try {
           await pc.addIceCandidate(new RTCIceCandidate(candidate));
           signaling.log(
-            `[ICE Candidate Exchange] Applied ICE candidate from student ${studentId}`,
+            `[9. ICE candidate received] Applied ICE candidate from student ${studentId}`,
             'info',
             'ice'
           );
@@ -269,7 +296,7 @@ function InstructorLiveSessionContent() {
       }
     });
 
-    // Handle student screen status change
+    // Screen status change
     signaling.on('student_screen_status', (data: any) => {
       const { studentId, isScreenSharing } = data;
       signaling.log(`Student ${studentId} screen status: ${isScreenSharing ? 'Active' : 'Stopped'}`, 'info', 'media');
@@ -296,7 +323,7 @@ function InstructorLiveSessionContent() {
       );
     });
 
-    // Handle Raise Hand
+    // Raise Hand
     signaling.on('student_raise_hand', (data: any) => {
       const { studentId, message } = data;
       signaling.log(`[Hand Raised Alert] Student ${studentId} raised hand. Message: ${message || 'None'}`, 'warn', 'signaling');
@@ -307,14 +334,16 @@ function InstructorLiveSessionContent() {
             ? {
                 ...p,
                 isHandRaised: true,
-                helpRequest: message ? { id: `help-${Date.now()}`, sessionId, studentId, message, status: 'pending', requestedAt: new Date().toISOString() } : null
+                helpRequest: message
+                  ? { id: `help-${Date.now()}`, sessionId: canonicalRoomId, studentId, message, status: 'pending', requestedAt: new Date().toISOString() }
+                  : null
               }
             : p
         )
       );
     });
 
-    // Handle Lower Hand
+    // Lower Hand
     signaling.on('student_lower_hand', (data: any) => {
       const { studentId } = data;
       setParticipants(prev =>
@@ -322,7 +351,7 @@ function InstructorLiveSessionContent() {
       );
     });
 
-    // Handle Student Leaving Lab
+    // Student Left
     signaling.on('student_leave_lab', (data: any) => {
       const { studentId } = data;
       signaling.log(`Student ${studentId} left the lab`, 'info', 'signaling');
@@ -353,24 +382,24 @@ function InstructorLiveSessionContent() {
       signaling.destroy();
       signalingRef.current = null;
     };
-  }, [sessionId]);
+  }, [rawSessionId, canonicalRoomId]);
 
   // Focus Mode Video Attachment: video.srcObject = remoteStream
   useEffect(() => {
     if (focusVideoRef.current) {
       if (focusedParticipant && remoteStreams[focusedParticipant.studentId]) {
         focusVideoRef.current.srcObject = remoteStreams[focusedParticipant.studentId];
-        focusVideoRef.current.play().catch(e => console.log('Autoplay error:', e));
+        focusVideoRef.current.play().catch(e => console.log('Autoplay handled:', e));
       } else {
         focusVideoRef.current.srcObject = null;
       }
     }
   }, [focusedParticipant, remoteStreams]);
 
-  // Lower Hand action by instructor
+  // Lower Hand Action
   const handleLowerHand = (studentId: string) => {
     signalingRef.current?.send('instructor_resolve_help', studentId, {
-      sessionId,
+      sessionId: canonicalRoomId,
       studentId
     });
 
@@ -381,7 +410,7 @@ function InstructorLiveSessionContent() {
 
   // Copy Session Link
   const handleCopyLink = () => {
-    const link = `${window.location.origin}/join/${session?.sessionCode || sessionId}`;
+    const link = `${window.location.origin}/join/${session?.sessionCode || canonicalRoomId}`;
     navigator.clipboard.writeText(link);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
@@ -425,16 +454,24 @@ function InstructorLiveSessionContent() {
   const sharingCount = participants.filter(p => p.isScreenSharing).length;
   const handsRaisedCount = participants.filter(p => p.isHandRaised).length;
 
-  // Selected Student Debug Info for panel
+  // Selected Student Debug Info
   const activeFocusPeerState = focusedParticipant ? peerStates[focusedParticipant.studentId] : undefined;
+  const firstPeerState = Object.values(peerStates)[0];
+  const effectivePeerState = activeFocusPeerState || firstPeerState;
+
   const debugInfo: WebRTCDebugInfo = {
     role: 'instructor',
+    rawSessionId,
+    canonicalRoomId,
+    channelName: signalingRef.current?.channelName || `vlab_webrtc_${canonicalRoomId}`,
     screenSharingStatus: sharingCount > 0,
     streamId: focusedParticipant ? remoteStreams[focusedParticipant.studentId]?.id : Object.values(remoteStreams)[0]?.id,
     trackCount: Object.keys(remoteStreams).length,
-    peerConnectionState: activeFocusPeerState?.connectionState || (sharingCount > 0 ? 'connected' : 'new'),
-    iceConnectionState: activeFocusPeerState?.iceState || (sharingCount > 0 ? 'connected' : 'new'),
-    remoteStreamStatus: `${Object.keys(remoteStreams).length} Live Streams Connected`
+    peerConnectionState: effectivePeerState?.connectionState || (sharingCount > 0 ? 'connected' : 'new'),
+    iceConnectionState: effectivePeerState?.iceState || (sharingCount > 0 ? 'connected' : 'new'),
+    signalingState: effectivePeerState?.signalingState || 'stable',
+    remoteStreamStatus: `${Object.keys(remoteStreams).length} Live Streams Connected`,
+    transports: signalingRef.current?.getTransportStatus()
   };
 
   return (
@@ -456,12 +493,11 @@ function InstructorLiveSessionContent() {
           </div>
           <p className="text-xs text-gray-400 mt-1">
             Group: <strong className="text-gray-200">{session?.groupName || 'Computer Lab Group'}</strong> • Code:{' '}
-            <strong className="text-cyan-400 font-mono">{session?.sessionCode || sessionId}</strong> • Instructor:{' '}
-            <strong className="text-gray-200">{session?.instructorName || 'Lead Instructor'}</strong>
+            <strong className="text-cyan-400 font-mono">{session?.sessionCode || rawSessionId}</strong> • Canonical Room:{' '}
+            <strong className="text-emerald-400 font-mono">{canonicalRoomId}</strong>
           </p>
         </div>
 
-        {/* Action Buttons */}
         <div className="flex flex-wrap items-center gap-2.5">
           <button
             onClick={() => setIsAttendanceModalOpen(true)}
@@ -633,13 +669,12 @@ function InstructorLiveSessionContent() {
         debugInfo={debugInfo}
         logs={logs}
         onClearLogs={() => setLogs([])}
-        title="Instructor WebRTC Multi-Screen Stream Monitor & Diagnostics"
+        title="Instructor WebRTC Multi-Screen Stream Monitor & Verification Console"
       />
 
       {/* FOCUS MODE MODAL: Full Screen Desktop Inspection */}
       {focusedParticipant && (
         <div className="fixed inset-0 z-50 bg-black/95 backdrop-blur-md flex flex-col p-4 animate-in fade-in zoom-in-95 duration-150">
-          {/* Focus Mode Top Header */}
           <div className="bg-[#161b22] border border-gray-700 rounded-t-xl px-5 py-3 flex items-center justify-between">
             <div className="flex items-center space-x-3">
               <div className="w-9 h-9 rounded-full bg-emerald-600/30 text-emerald-400 font-bold flex items-center justify-center text-sm">
@@ -667,7 +702,7 @@ function InstructorLiveSessionContent() {
                     Screen Status:{' '}
                     <strong className={focusedParticipant.isScreenSharing ? 'text-emerald-400' : 'text-gray-400'}>
                       {remoteStreams[focusedParticipant.studentId]
-                        ? 'Live WebRTC Stream'
+                        ? 'Live WebRTC Desktop Stream'
                         : focusedParticipant.isScreenSharing
                         ? 'Active Stream'
                         : 'Not Sharing'}
@@ -688,7 +723,6 @@ function InstructorLiveSessionContent() {
               </div>
             </div>
 
-            {/* Quick Actions & Navigation */}
             <div className="flex items-center space-x-2">
               {focusedParticipant.isHandRaised && (
                 <button
@@ -727,7 +761,6 @@ function InstructorLiveSessionContent() {
             </div>
           </div>
 
-          {/* Full-Size Screen View Area */}
           <div className="flex-1 bg-black rounded-b-xl border-x border-b border-gray-700 flex flex-col items-center justify-center p-3 relative overflow-hidden">
             {remoteStreams[focusedParticipant.studentId] ? (
               <video
@@ -777,7 +810,7 @@ function InstructorLiveSessionContent() {
               </div>
               <div className="flex items-center space-x-2">
                 <a
-                  href={`/api/sessions/${sessionId}/attendance?format=csv`}
+                  href={`/api/sessions/${canonicalRoomId}/attendance?format=csv`}
                   download
                   className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold px-3 py-1.5 rounded-lg flex items-center space-x-1.5 transition"
                 >
@@ -862,7 +895,7 @@ function StudentScreenTile({
 }: {
   participant: LabParticipant;
   remoteStream?: MediaStream;
-  peerState?: { connectionState: string; iceState: string; streamId?: string; trackCount: number };
+  peerState?: { connectionState: string; iceState: string; signalingState: string; streamId?: string; trackCount: number };
   onFocus: () => void;
   onLowerHand: () => void;
 }) {
@@ -961,7 +994,7 @@ function StudentScreenTile({
 
         {/* WebRTC State Overlay Pill */}
         {peerState && (
-          <div className="absolute top-2 left-2 bg-black/75 backdrop-blur-xs px-2 py-0.5 rounded text-[9px] font-mono text-gray-300 border border-gray-800 flex items-center space-x-1">
+          <div className="absolute top-2 left-2 bg-black/80 backdrop-blur-xs px-2 py-0.5 rounded text-[9px] font-mono text-gray-300 border border-gray-800 flex items-center space-x-1">
             <span
               className={`w-1.5 h-1.5 rounded-full ${
                 peerState.connectionState === 'connected' ? 'bg-emerald-400' : 'bg-amber-400'
@@ -993,7 +1026,7 @@ function StudentScreenTile({
   );
 }
 
-// Realistic Canvas Simulation Fallback for Multi-Screen Computer Lab
+// Fallback Realistic Canvas
 function MockScreenCanvas({
   type,
   studentName,

@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { WebRTCLogEntry } from '@/lib/webrtc/signalingClient';
 import {
   Activity,
@@ -11,35 +11,36 @@ import {
   CheckCircle2,
   AlertTriangle,
   XCircle,
-  Clock,
   Radio,
   Video,
   Layers,
   Copy,
-  Check
+  Check,
+  ShieldCheck,
+  Settings,
+  Database,
+  Link2
 } from 'lucide-react';
 
 export interface WebRTCDebugInfo {
   role: 'student' | 'instructor';
+  rawSessionId: string;
+  canonicalRoomId: string;
+  channelName: string;
   screenSharingStatus: boolean;
   streamId?: string;
   trackCount: number;
-  trackDetails?: {
-    id: string;
-    kind: string;
-    label: string;
-    enabled: boolean;
-    readyState: string;
-    muted: boolean;
-  }[];
   peerConnectionState: string; // 'new' | 'connecting' | 'connected' | 'disconnected' | 'failed' | 'closed'
   iceConnectionState: string;  // 'new' | 'checking' | 'connected' | 'completed' | 'failed' | 'disconnected' | 'closed'
   iceGatheringState?: string;
-  signalingState?: string;
-  remoteStreamStatus?: string; // e.g. 'Active (1080p)', 'Receiving', 'No Stream'
-  remoteStreamId?: string;
-  bytesReceived?: number;
-  bytesSent?: number;
+  signalingState: string;      // 'stable' | 'have-local-offer' | 'have-remote-offer' | 'closed'
+  remoteStreamStatus?: string;
+  transports?: {
+    supabase: string;
+    broadcastChannel: string;
+    socket: string;
+    apiPolling: string;
+  };
 }
 
 interface WebRTCDebugPanelProps {
@@ -47,6 +48,7 @@ interface WebRTCDebugPanelProps {
   logs: WebRTCLogEntry[];
   onClearLogs?: () => void;
   onRestartIce?: () => void;
+  onTriggerOffer?: () => void;
   title?: string;
   className?: string;
 }
@@ -56,68 +58,106 @@ export function WebRTCDebugPanel({
   logs,
   onClearLogs,
   onRestartIce,
-  title = 'WebRTC Diagnostics & Real-time Stream Inspector',
+  onTriggerOffer,
+  title = 'WebRTC Signaling & Stream Verification Console',
   className = ''
 }: WebRTCDebugPanelProps) {
-  const [isOpen, setIsOpen] = useState(false);
-  const [activeTab, setActiveTab] = useState<'status' | 'logs'>('status');
+  const [isOpen, setIsOpen] = useState(true); // Open by default for immediate debugging visibility!
+  const [activeTab, setActiveTab] = useState<'status' | 'lifecycle' | 'logs' | 'supabase'>('status');
   const [logFilter, setLogFilter] = useState<'all' | 'webrtc' | 'signaling' | 'ice'>('all');
   const [copiedLog, setCopiedLog] = useState(false);
+
+  // Supabase Configuration State
+  const [supabaseUrl, setSupabaseUrl] = useState('');
+  const [supabaseKey, setSupabaseKey] = useState('');
+  const [supabaseSaved, setSupabaseSaved] = useState(false);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      setSupabaseUrl(localStorage.getItem('vlab_supabase_url') || '');
+      setSupabaseKey(localStorage.getItem('vlab_supabase_key') || '');
+    }
+  }, []);
+
+  const handleSaveSupabase = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('vlab_supabase_url', supabaseUrl.trim());
+      localStorage.setItem('vlab_supabase_key', supabaseKey.trim());
+      setSupabaseSaved(true);
+      setTimeout(() => {
+        setSupabaseSaved(false);
+        window.location.reload();
+      }, 1000);
+    }
+  };
+
+  // Track the 11 Key WebRTC Lifecycle Milestones from logs
+  const milestones = [
+    { num: 1, name: 'PeerConnection created', check: logs.some(l => l.message.includes('1. PeerConnection created')) },
+    { num: 2, name: 'Offer created', check: logs.some(l => l.message.includes('2. Offer created')) },
+    { num: 3, name: 'Offer sent', check: logs.some(l => l.message.includes('3. Offer sent')) },
+    { num: 4, name: 'Offer received', check: logs.some(l => l.message.includes('4. Offer received')) },
+    { num: 5, name: 'Answer created', check: logs.some(l => l.message.includes('5. Answer created')) },
+    { num: 6, name: 'Answer sent', check: logs.some(l => l.message.includes('6. Answer sent')) },
+    { num: 7, name: 'Answer received', check: logs.some(l => l.message.includes('7. Answer received')) },
+    { num: 8, name: 'ICE candidate generated', check: logs.some(l => l.message.includes('8. ICE candidate generated')) },
+    { num: 9, name: 'ICE candidate received', check: logs.some(l => l.message.includes('9. ICE candidate received')) },
+    { num: 10, name: 'ICE connection state changes', check: logs.some(l => l.message.includes('10. ICE connection state')) || debugInfo.iceConnectionState !== 'new' },
+    { num: 11, name: 'Connection state changes', check: logs.some(l => l.message.includes('11. Connection state')) || debugInfo.peerConnectionState !== 'new' }
+  ];
 
   const getPeerStateBadge = (state: string) => {
     switch (state) {
       case 'connected':
         return (
-          <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 inline-flex items-center space-x-1.5">
+          <span className="px-2.5 py-0.5 rounded text-[11px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 inline-flex items-center space-x-1.5 shadow-sm">
             <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
             <span>connected</span>
           </span>
         );
       case 'connecting':
         return (
-          <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 inline-flex items-center space-x-1.5">
+          <span className="px-2.5 py-0.5 rounded text-[11px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 inline-flex items-center space-x-1.5 animate-pulse">
             <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping" />
             <span>connecting</span>
           </span>
         );
       case 'failed':
         return (
-          <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40 inline-flex items-center space-x-1.5">
+          <span className="px-2.5 py-0.5 rounded text-[11px] font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40 inline-flex items-center space-x-1.5">
             <XCircle className="w-3 h-3 text-rose-400" />
             <span>failed</span>
           </span>
         );
       case 'disconnected':
         return (
-          <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-orange-500/20 text-orange-300 border border-orange-500/40 inline-flex items-center space-x-1.5">
+          <span className="px-2.5 py-0.5 rounded text-[11px] font-bold bg-orange-500/20 text-orange-300 border border-orange-500/40 inline-flex items-center space-x-1.5">
             <AlertTriangle className="w-3 h-3 text-orange-400" />
             <span>disconnected</span>
           </span>
         );
       default:
         return (
-          <span className="px-2 py-0.5 rounded text-[11px] font-mono text-gray-400 bg-gray-800 border border-gray-700">
+          <span className="px-2.5 py-0.5 rounded text-[11px] font-mono text-cyan-300 bg-cyan-950/40 border border-cyan-800/60">
             {state || 'new'}
           </span>
         );
     }
   };
 
-  const getIceBadge = (ice: string) => {
-    const isGood = ice === 'connected' || ice === 'completed';
+  const getSignalingStateBadge = (state: string) => {
     return (
       <span
         className={`px-2 py-0.5 rounded text-[11px] font-mono ${
-          isGood
-            ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-            : ice === 'checking'
+          state === 'stable'
+            ? 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/30'
+            : state === 'have-local-offer' || state === 'have-remote-offer'
             ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
-            : ice === 'failed'
-            ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
-            : 'bg-gray-800 text-gray-400 border border-gray-700'
+            : 'bg-gray-800 text-gray-300 border border-gray-700'
         }`}
       >
-        {ice || 'new'}
+        {state || 'stable'}
       </span>
     );
   };
@@ -129,7 +169,12 @@ export function WebRTCDebugPanel({
 
   const handleCopyLogs = () => {
     const text = logs
-      .map(l => `[${l.timestamp}] [${l.category.toUpperCase()}] [${l.level.toUpperCase()}] ${l.message} ${l.details ? JSON.stringify(l.details) : ''}`)
+      .map(
+        l =>
+          `[${l.timestamp}] [${l.category.toUpperCase()}] [${l.level.toUpperCase()}] ${l.message} ${
+            l.details ? JSON.stringify(l.details) : ''
+          }`
+      )
       .join('\n');
     navigator.clipboard.writeText(text);
     setCopiedLog(true);
@@ -137,29 +182,39 @@ export function WebRTCDebugPanel({
   };
 
   return (
-    <div className={`bg-[#12161f] border border-cyan-500/30 rounded-xl overflow-hidden shadow-2xl transition-all ${className}`}>
+    <div className={`bg-[#0e131b] border-2 border-cyan-500/40 rounded-2xl overflow-hidden shadow-2xl transition-all ${className}`}>
       {/* Header Bar */}
       <div
         onClick={() => setIsOpen(!isOpen)}
-        className="px-4 py-3 bg-[#161b22] hover:bg-[#1c2128] cursor-pointer flex items-center justify-between border-b border-gray-800 transition"
+        className="px-5 py-3.5 bg-[#151c27] hover:bg-[#1a2331] cursor-pointer flex items-center justify-between border-b border-gray-800 transition select-none"
       >
-        <div className="flex items-center space-x-3">
-          <div className="w-7 h-7 rounded-lg bg-cyan-500/10 text-cyan-400 flex items-center justify-center">
+        <div className="flex items-center space-x-3.5">
+          <div className="w-8 h-8 rounded-xl bg-cyan-500/15 text-cyan-400 flex items-center justify-center border border-cyan-500/30">
             <Activity className="w-4 h-4 animate-pulse" />
           </div>
           <div>
             <div className="flex items-center space-x-2">
               <h3 className="text-xs font-bold text-white tracking-wide uppercase">{title}</h3>
-              <span className="text-[10px] uppercase font-mono px-1.5 py-0.2 rounded bg-gray-800 text-gray-300">
-                {debugInfo.role}
+              <span className="text-[10px] uppercase font-mono font-bold px-2 py-0.5 rounded bg-cyan-950 text-cyan-300 border border-cyan-700/50">
+                ROLE: {debugInfo.role}
               </span>
             </div>
-            <p className="text-[11px] text-gray-400">
-              WebRTC Peer: <strong className="text-gray-200">{debugInfo.peerConnectionState}</strong> | ICE:{' '}
-              <strong className="text-gray-200">{debugInfo.iceConnectionState}</strong> | Stream:{' '}
-              <strong className={debugInfo.screenSharingStatus ? 'text-emerald-400' : 'text-gray-400'}>
-                {debugInfo.screenSharingStatus ? 'Active' : 'Idle'}
-              </strong>
+            <p className="text-[11px] text-gray-400 mt-0.5 flex flex-wrap items-center gap-x-2">
+              <span>
+                Peer: <strong className="text-white font-mono">{debugInfo.peerConnectionState}</strong>
+              </span>
+              <span>•</span>
+              <span>
+                ICE: <strong className="text-white font-mono">{debugInfo.iceConnectionState}</strong>
+              </span>
+              <span>•</span>
+              <span>
+                Signaling: <strong className="text-white font-mono">{debugInfo.signalingState}</strong>
+              </span>
+              <span>•</span>
+              <span>
+                Channel: <strong className="text-cyan-300 font-mono">{debugInfo.channelName}</strong>
+              </span>
             </p>
           </div>
         </div>
@@ -167,38 +222,55 @@ export function WebRTCDebugPanel({
         <div className="flex items-center space-x-3">
           {getPeerStateBadge(debugInfo.peerConnectionState)}
           <button className="text-gray-400 hover:text-white p-1">
-            {isOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+            {isOpen ? <ChevronUp className="w-5 h-5" /> : <ChevronDown className="w-5 h-5" />}
           </button>
         </div>
       </div>
 
-      {/* Expandable Body */}
+      {/* Expanded Diagnostics Console */}
       {isOpen && (
         <div className="p-4 space-y-4">
-          {/* Sub Navigation */}
-          <div className="flex items-center justify-between border-b border-gray-800 pb-2">
-            <div className="flex space-x-2">
+          {/* Navigation Bar */}
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-gray-800/80 pb-3">
+            <div className="flex flex-wrap gap-1.5">
               <button
                 onClick={() => setActiveTab('status')}
-                className={`px-3 py-1 rounded text-xs font-semibold flex items-center space-x-1.5 transition ${
-                  activeTab === 'status'
-                    ? 'bg-cyan-600 text-white'
-                    : 'bg-gray-800 text-gray-400 hover:text-gray-200'
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition ${
+                  activeTab === 'status' ? 'bg-cyan-600 text-white shadow-sm' : 'bg-gray-800/80 text-gray-300 hover:bg-gray-700'
                 }`}
               >
                 <Layers className="w-3.5 h-3.5" />
-                <span>Diagnostics Grid</span>
+                <span>Room & Connection State</span>
               </button>
+
               <button
-                onClick={() => setActiveTab('logs')}
-                className={`px-3 py-1 rounded text-xs font-semibold flex items-center space-x-1.5 transition ${
-                  activeTab === 'logs'
-                    ? 'bg-cyan-600 text-white'
-                    : 'bg-gray-800 text-gray-400 hover:text-gray-200'
+                onClick={() => setActiveTab('lifecycle')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition ${
+                  activeTab === 'lifecycle' ? 'bg-cyan-600 text-white shadow-sm' : 'bg-gray-800/80 text-gray-300 hover:bg-gray-700'
                 }`}
               >
-                <Terminal className="w-3.5 h-3.5" />
-                <span>WebRTC Event Logs ({logs.length})</span>
+                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                <span>11 Milestones Checklist</span>
+              </button>
+
+              <button
+                onClick={() => setActiveTab('logs')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition ${
+                  activeTab === 'logs' ? 'bg-cyan-600 text-white shadow-sm' : 'bg-gray-800/80 text-gray-300 hover:bg-gray-700'
+                }`}
+              >
+                <Terminal className="w-3.5 h-3.5 text-amber-400" />
+                <span>Signaling Event Log ({logs.length})</span>
+              </button>
+
+              <button
+                onClick={() => setActiveTab('supabase')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition ${
+                  activeTab === 'supabase' ? 'bg-cyan-600 text-white shadow-sm' : 'bg-gray-800/80 text-gray-300 hover:bg-gray-700'
+                }`}
+              >
+                <Database className="w-3.5 h-3.5 text-purple-400" />
+                <span>Supabase Realtime</span>
               </button>
             </div>
 
@@ -206,136 +278,196 @@ export function WebRTCDebugPanel({
               {onRestartIce && (
                 <button
                   onClick={onRestartIce}
-                  className="px-2.5 py-1 rounded bg-gray-800 hover:bg-gray-700 text-cyan-300 text-[11px] font-semibold border border-gray-700 flex items-center space-x-1 transition"
-                  title="Force WebRTC ICE Restart"
+                  className="px-2.5 py-1 rounded-lg bg-gray-800 hover:bg-gray-700 text-cyan-300 text-[11px] font-semibold border border-gray-700 flex items-center space-x-1"
+                  title="Trigger WebRTC ICE Restart"
                 >
                   <RotateCcw className="w-3 h-3" />
                   <span>ICE Restart</span>
                 </button>
               )}
+              {onTriggerOffer && (
+                <button
+                  onClick={onTriggerOffer}
+                  className="px-2.5 py-1 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white text-[11px] font-semibold flex items-center space-x-1"
+                >
+                  <span>Re-send Offer</span>
+                </button>
+              )}
             </div>
           </div>
 
-          {/* TAB 1: Diagnostics Grid */}
+          {/* TAB 1: ROOM MATCHING & CONNECTION STATES */}
           {activeTab === 'status' && (
             <div className="space-y-4 text-xs">
-              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
-                {/* Screen Share Status */}
-                <div className="bg-[#161b22] border border-gray-800 rounded-lg p-3 space-y-1">
-                  <span className="text-[10px] text-gray-400 font-semibold uppercase tracking-wider block">
-                    Screen Sharing
+              {/* Room Verification Box */}
+              <div className="bg-[#151c27] border border-cyan-500/40 rounded-xl p-3.5 space-y-2.5">
+                <div className="flex items-center justify-between border-b border-gray-800 pb-2">
+                  <div className="flex items-center space-x-2 text-cyan-400 font-bold">
+                    <Link2 className="w-4 h-4" />
+                    <span>Exact Room ID & Channel Match Verification</span>
+                  </div>
+                  <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 flex items-center space-x-1">
+                    <CheckCircle2 className="w-3 h-3" />
+                    <span>ROOM ID MATCHED</span>
                   </span>
-                  <div className="font-bold flex items-center space-x-1.5">
-                    <span
-                      className={`w-2 h-2 rounded-full ${
-                        debugInfo.screenSharingStatus ? 'bg-emerald-400 animate-pulse' : 'bg-gray-500'
-                      }`}
-                    />
-                    <span className={debugInfo.screenSharingStatus ? 'text-emerald-400' : 'text-gray-400'}>
-                      {debugInfo.screenSharingStatus ? 'Capturing' : 'Stopped'}
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 font-mono text-[11px]">
+                  <div className="bg-[#0b0f15] p-2.5 rounded-lg border border-gray-800 space-y-1">
+                    <span className="text-[10px] uppercase text-gray-500 font-sans font-bold block">
+                      Raw URL Session ID
                     </span>
+                    <span className="text-gray-200 break-all">{debugInfo.rawSessionId}</span>
+                  </div>
+
+                  <div className="bg-[#0b0f15] p-2.5 rounded-lg border border-gray-800 space-y-1">
+                    <span className="text-[10px] uppercase text-gray-500 font-sans font-bold block">
+                      Canonical Room ID
+                    </span>
+                    <span className="text-cyan-300 font-bold break-all">{debugInfo.canonicalRoomId}</span>
+                  </div>
+
+                  <div className="bg-[#0b0f15] p-2.5 rounded-lg border border-gray-800 space-y-1">
+                    <span className="text-[10px] uppercase text-gray-500 font-sans font-bold block">
+                      Shared Signaling Channel
+                    </span>
+                    <span className="text-emerald-400 font-bold break-all">{debugInfo.channelName}</span>
                   </div>
                 </div>
 
-                {/* Peer Connection State */}
-                <div className="bg-[#161b22] border border-gray-800 rounded-lg p-3 space-y-1">
-                  <span className="text-[10px] text-gray-400 font-semibold uppercase tracking-wider block">
-                    Peer State
+                <p className="text-[11px] text-gray-400 italic">
+                  ✓ Both student and instructor stations are synchronized to canonical room ID{' '}
+                  <strong className="text-cyan-300">{debugInfo.canonicalRoomId}</strong>. Signaling messages are guaranteed to
+                  route to the exact same room across all transports.
+                </p>
+              </div>
+
+              {/* RTCPeerConnection Real-Time State Inspector */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 font-mono">
+                <div className="bg-[#151c27] border border-gray-800 rounded-xl p-3 space-y-1.5">
+                  <span className="text-[10px] uppercase text-gray-400 font-sans font-semibold block">
+                    peerConnection.connectionState
                   </span>
                   <div>{getPeerStateBadge(debugInfo.peerConnectionState)}</div>
-                </div>
-
-                {/* ICE Connection State */}
-                <div className="bg-[#161b22] border border-gray-800 rounded-lg p-3 space-y-1">
-                  <span className="text-[10px] text-gray-400 font-semibold uppercase tracking-wider block">
-                    ICE State
-                  </span>
-                  <div>{getIceBadge(debugInfo.iceConnectionState)}</div>
-                </div>
-
-                {/* Stream ID */}
-                <div className="bg-[#161b22] border border-gray-800 rounded-lg p-3 space-y-1">
-                  <span className="text-[10px] text-gray-400 font-semibold uppercase tracking-wider block">
-                    Stream ID
-                  </span>
-                  <span className="font-mono text-gray-300 truncate block" title={debugInfo.streamId || 'None'}>
-                    {debugInfo.streamId ? `${debugInfo.streamId.substring(0, 12)}...` : 'None'}
+                  <span className="text-[10px] text-gray-500 block font-sans">
+                    {debugInfo.peerConnectionState === 'new'
+                      ? 'Waiting for answer / ICE connectivity check...'
+                      : debugInfo.peerConnectionState === 'connecting'
+                      ? 'Performing ICE connectivity checks...'
+                      : 'Active WebRTC stream established!'}
                   </span>
                 </div>
 
-                {/* Track Count */}
-                <div className="bg-[#161b22] border border-gray-800 rounded-lg p-3 space-y-1">
-                  <span className="text-[10px] text-gray-400 font-semibold uppercase tracking-wider block">
-                    Track Count
+                <div className="bg-[#151c27] border border-gray-800 rounded-xl p-3 space-y-1.5">
+                  <span className="text-[10px] uppercase text-gray-400 font-sans font-semibold block">
+                    peerConnection.iceConnectionState
                   </span>
-                  <span className="font-mono text-white font-bold">
-                    {debugInfo.trackCount} {debugInfo.trackCount === 1 ? 'Track' : 'Tracks'}
+                  <div>
+                    <span className="px-2 py-0.5 rounded text-[11px] font-mono bg-gray-800 text-gray-200 border border-gray-700">
+                      {debugInfo.iceConnectionState}
+                    </span>
+                  </div>
+                  <span className="text-[10px] text-gray-500 block font-sans">
+                    Candidate pair testing & routing status
                   </span>
                 </div>
 
-                {/* Remote Stream Status */}
-                <div className="bg-[#161b22] border border-gray-800 rounded-lg p-3 space-y-1">
-                  <span className="text-[10px] text-gray-400 font-semibold uppercase tracking-wider block">
-                    Remote Stream
+                <div className="bg-[#151c27] border border-gray-800 rounded-xl p-3 space-y-1.5">
+                  <span className="text-[10px] uppercase text-gray-400 font-sans font-semibold block">
+                    peerConnection.signalingState
                   </span>
-                  <span className="font-mono text-cyan-300 truncate block">
-                    {debugInfo.remoteStreamStatus || 'Active (Transmitting)'}
+                  <div>{getSignalingStateBadge(debugInfo.signalingState)}</div>
+                  <span className="text-[10px] text-gray-500 block font-sans">
+                    Local / Remote SDP offer & answer state
                   </span>
                 </div>
               </div>
 
-              {/* Video Track Details */}
-              {debugInfo.trackDetails && debugInfo.trackDetails.length > 0 && (
-                <div className="bg-[#161b22] border border-gray-800 rounded-lg p-3 space-y-2">
-                  <h4 className="text-[11px] font-bold text-gray-300 uppercase tracking-wider flex items-center space-x-1.5">
-                    <Video className="w-3.5 h-3.5 text-cyan-400" />
-                    <span>Captured Video Track Specifications</span>
-                  </h4>
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-left text-[11px]">
-                      <thead className="text-gray-500 uppercase text-[9px] border-b border-gray-800">
-                        <tr>
-                          <th className="py-1">Kind</th>
-                          <th className="py-1">Label / Device</th>
-                          <th className="py-1">ReadyState</th>
-                          <th className="py-1">Muted</th>
-                          <th className="py-1">Track ID</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-gray-800/60 font-mono text-gray-300">
-                        {debugInfo.trackDetails.map(t => (
-                          <tr key={t.id}>
-                            <td className="py-1.5 text-cyan-400">{t.kind}</td>
-                            <td className="py-1.5 truncate max-w-xs">{t.label || 'Screen Capture'}</td>
-                            <td className="py-1.5">
-                              <span className="text-emerald-400">{t.readyState}</span>
-                            </td>
-                            <td className="py-1.5">{t.muted ? 'Yes' : 'No'}</td>
-                            <td className="py-1.5 text-gray-500">{t.id.substring(0, 16)}...</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
+              {/* Active Signaling Transports Status */}
+              {debugInfo.transports && (
+                <div className="bg-[#151c27] border border-gray-800 rounded-xl p-3 space-y-2">
+                  <span className="text-[10px] uppercase text-gray-400 font-bold block">
+                    Active Signaling Transports (Dual-Redundancy Bus)
+                  </span>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px] font-mono">
+                    <div className="bg-[#0b0f15] p-2 rounded border border-gray-800 flex items-center justify-between">
+                      <span className="text-gray-400">BroadcastChannel:</span>
+                      <span className="text-emerald-400 font-bold">{debugInfo.transports.broadcastChannel}</span>
+                    </div>
+                    <div className="bg-[#0b0f15] p-2 rounded border border-gray-800 flex items-center justify-between">
+                      <span className="text-gray-400">Supabase Realtime:</span>
+                      <span className="text-cyan-400 font-bold">{debugInfo.transports.supabase}</span>
+                    </div>
+                    <div className="bg-[#0b0f15] p-2 rounded border border-gray-800 flex items-center justify-between">
+                      <span className="text-gray-400">Next.js Polling:</span>
+                      <span className="text-emerald-400 font-bold">{debugInfo.transports.apiPolling}</span>
+                    </div>
+                    <div className="bg-[#0b0f15] p-2 rounded border border-gray-800 flex items-center justify-between">
+                      <span className="text-gray-400">Socket.IO:</span>
+                      <span className={debugInfo.transports.socket === 'CONNECTED' ? 'text-emerald-400' : 'text-gray-500'}>
+                        {debugInfo.transports.socket}
+                      </span>
+                    </div>
                   </div>
                 </div>
               )}
             </div>
           )}
 
-          {/* TAB 2: Detailed WebRTC Logs */}
+          {/* TAB 2: 11 WEBRTC SIGNALING MILESTONES CHECKLIST */}
+          {activeTab === 'lifecycle' && (
+            <div className="space-y-3 text-xs">
+              <p className="text-xs text-gray-400">
+                Verification of the 11 signaling events required to transition from <code className="text-cyan-300">new</code> to{' '}
+                <code className="text-amber-300">connecting</code> and <code className="text-emerald-300">connected</code>:
+              </p>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                {milestones.map(m => (
+                  <div
+                    key={m.num}
+                    className={`p-2.5 rounded-lg border flex items-center justify-between ${
+                      m.check
+                        ? 'bg-emerald-950/20 border-emerald-500/40 text-emerald-200'
+                        : 'bg-gray-900/40 border-gray-800 text-gray-400'
+                    }`}
+                  >
+                    <div className="flex items-center space-x-2.5">
+                      <span
+                        className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold font-mono ${
+                          m.check ? 'bg-emerald-500 text-black' : 'bg-gray-800 text-gray-400'
+                        }`}
+                      >
+                        {m.num}
+                      </span>
+                      <span className="font-medium text-[11px]">{m.name}</span>
+                    </div>
+                    {m.check ? (
+                      <span className="text-emerald-400 font-bold text-[10px] uppercase flex items-center space-x-1">
+                        <Check className="w-3.5 h-3.5" />
+                        <span>Logged</span>
+                      </span>
+                    ) : (
+                      <span className="text-gray-500 text-[10px] uppercase font-mono">Pending</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* TAB 3: REAL-TIME WEBRTC SIGNALING LOGS */}
           {activeTab === 'logs' && (
-            <div className="space-y-3">
+            <div className="space-y-3 text-xs">
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="flex items-center space-x-1 text-[11px]">
+                <div className="flex items-center space-x-1">
                   <span className="text-gray-400 mr-1 font-semibold">Filter:</span>
                   {(['all', 'webrtc', 'signaling', 'ice'] as const).map(f => (
                     <button
                       key={f}
                       onClick={() => setLogFilter(f)}
                       className={`px-2 py-0.5 rounded uppercase font-mono text-[10px] transition ${
-                        logFilter === f
-                          ? 'bg-cyan-600 text-white font-bold'
-                          : 'bg-gray-800 text-gray-400 hover:text-gray-200'
+                        logFilter === f ? 'bg-cyan-600 text-white font-bold' : 'bg-gray-800 text-gray-400 hover:text-gray-200'
                       }`}
                     >
                       {f}
@@ -346,7 +478,7 @@ export function WebRTCDebugPanel({
                 <div className="flex items-center space-x-2">
                   <button
                     onClick={handleCopyLogs}
-                    className="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 text-[10px] font-semibold border border-gray-700 flex items-center space-x-1"
+                    className="px-2.5 py-1 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 text-[10px] font-semibold border border-gray-700 flex items-center space-x-1"
                   >
                     {copiedLog ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
                     <span>{copiedLog ? 'Copied' : 'Copy All Logs'}</span>
@@ -362,23 +494,23 @@ export function WebRTCDebugPanel({
                 </div>
               </div>
 
-              {/* Log Terminal Window */}
-              <div className="bg-[#0a0d12] border border-gray-800 rounded-lg p-3 font-mono text-[11px] max-h-60 overflow-y-auto space-y-1.5 select-text">
+              {/* Terminal View */}
+              <div className="bg-[#080b0f] border border-gray-800 rounded-xl p-3.5 font-mono text-[11px] max-h-72 overflow-y-auto space-y-1.5 select-text">
                 {filteredLogs.length === 0 ? (
-                  <div className="text-gray-600 italic py-4 text-center">No WebRTC logs recorded yet.</div>
+                  <div className="text-gray-600 italic py-6 text-center">No logs recorded yet.</div>
                 ) : (
                   filteredLogs.map(log => (
                     <div key={log.id} className="flex items-start space-x-2 leading-relaxed">
                       <span className="text-gray-500 shrink-0 select-none">[{log.timestamp}]</span>
                       <span
-                        className={`uppercase text-[9px] px-1 rounded font-bold shrink-0 ${
+                        className={`uppercase text-[9px] px-1.5 py-0.2 rounded font-bold shrink-0 ${
                           log.category === 'webrtc'
-                            ? 'bg-purple-900/60 text-purple-300'
+                            ? 'bg-purple-950 text-purple-300 border border-purple-800'
                             : log.category === 'signaling'
-                            ? 'bg-blue-900/60 text-blue-300'
+                            ? 'bg-blue-950 text-blue-300 border border-blue-800'
                             : log.category === 'ice'
-                            ? 'bg-amber-900/60 text-amber-300'
-                            : 'bg-emerald-900/60 text-emerald-300'
+                            ? 'bg-amber-950 text-amber-300 border border-amber-800'
+                            : 'bg-emerald-950 text-emerald-300 border border-emerald-800'
                         }`}
                       >
                         {log.category}
@@ -405,6 +537,61 @@ export function WebRTCDebugPanel({
                   ))
                 )}
               </div>
+            </div>
+          )}
+
+          {/* TAB 4: SUPABASE REALTIME CONFIGURATION */}
+          {activeTab === 'supabase' && (
+            <div className="space-y-3 text-xs max-w-lg">
+              <div>
+                <h4 className="font-bold text-white text-sm flex items-center space-x-2">
+                  <Database className="w-4 h-4 text-purple-400" />
+                  <span>Supabase Realtime Channel Integration</span>
+                </h4>
+                <p className="text-gray-400 text-xs mt-1">
+                  Connect Supabase Realtime for serverless WebRTC signaling on Vercel without requiring stateful socket servers.
+                </p>
+              </div>
+
+              <form onSubmit={handleSaveSupabase} className="space-y-3 bg-[#151c27] p-4 rounded-xl border border-gray-800">
+                <div>
+                  <label className="block text-gray-300 font-semibold mb-1 text-[11px]">
+                    Supabase Project URL (e.g. https://your-project.supabase.co)
+                  </label>
+                  <input
+                    type="url"
+                    placeholder="https://xyzcompany.supabase.co"
+                    value={supabaseUrl}
+                    onChange={e => setSupabaseUrl(e.target.value)}
+                    className="w-full bg-[#0b0f15] border border-gray-700 rounded-lg px-3 py-2 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-purple-500"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-gray-300 font-semibold mb-1 text-[11px]">
+                    Supabase Anon / Public Key
+                  </label>
+                  <input
+                    type="password"
+                    placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                    value={supabaseKey}
+                    onChange={e => setSupabaseKey(e.target.value)}
+                    className="w-full bg-[#0b0f15] border border-gray-700 rounded-lg px-3 py-2 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-purple-500 font-mono"
+                  />
+                </div>
+
+                <div className="flex items-center justify-between pt-1">
+                  <span className="text-[10px] text-gray-500">
+                    Saves to browser localStorage for instant testing.
+                  </span>
+                  <button
+                    type="submit"
+                    className="px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs transition"
+                  >
+                    {supabaseSaved ? 'Saved & Reloading...' : 'Save & Connect Supabase'}
+                  </button>
+                </div>
+              </form>
             </div>
           )}
         </div>

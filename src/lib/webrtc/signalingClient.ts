@@ -1,4 +1,5 @@
 import { io, Socket } from 'socket.io-client';
+import { SupabaseSignalingTransport } from './supabaseSignaling';
 
 export interface WebRTCLogEntry {
   id: string;
@@ -23,25 +24,32 @@ export const RTC_CONFIGURATION: RTCConfiguration = {
 type EventListener = (data: any) => void;
 
 export class UnifiedSignalingClient {
-  private sessionId: string;
-  private clientId: string;
-  private role: 'instructor' | 'student';
-  private socket: Socket | null = null;
+  public rawSessionId: string;
+  public canonicalRoomId: string;
+  public channelName: string;
+  public clientId: string;
+  public role: 'instructor' | 'student';
+
+  private supabaseTransport: SupabaseSignalingTransport | null = null;
   private broadcastChannel: BroadcastChannel | null = null;
+  private socket: Socket | null = null;
   private pollingTimer: NodeJS.Timeout | null = null;
-  private lastPolledTimestamp: number = Date.now();
+  private lastPolledTimestamp: number = Date.now() - 5000;
   private listeners: Map<string, Set<EventListener>> = new Map();
   private processedMessageIds: Set<string> = new Set();
-  private isConnected: boolean = false;
   private onLogCallback?: (entry: WebRTCLogEntry) => void;
 
   constructor(
     sessionId: string,
+    canonicalRoomId: string,
     clientId: string,
     role: 'instructor' | 'student',
     onLog?: (entry: WebRTCLogEntry) => void
   ) {
-    this.sessionId = sessionId;
+    this.rawSessionId = sessionId;
+    this.canonicalRoomId = canonicalRoomId || sessionId;
+    // Canonical channel name guaranteed to match between student and instructor
+    this.channelName = `vlab_webrtc_${this.canonicalRoomId.toLowerCase().replace(/[^a-z0-9_-]/g, '')}`;
     this.clientId = clientId;
     this.role = role;
     this.onLogCallback = onLog;
@@ -61,70 +69,84 @@ export class UnifiedSignalingClient {
   ) {
     const entry: WebRTCLogEntry = {
       id: `${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3 }),
+      timestamp: new Date().toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        fractionalSecondDigits: 3
+      }),
       level,
       category,
       message,
       details
     };
 
-    console.log(`[${entry.category.toUpperCase()}] ${entry.message}`, details || '');
+    console.log(`[${category.toUpperCase()}] ${message}`, details || '');
     if (this.onLogCallback) {
       this.onLogCallback(entry);
     }
   }
 
   private init() {
-    this.log(`Initializing signaling channel for session: ${this.sessionId}, role: ${this.role}, clientId: ${this.clientId}`);
+    this.log(
+      `Signaling initialized | Role: ${this.role} | Room ID: ${this.canonicalRoomId} | Channel: ${this.channelName} | Client ID: ${this.clientId}`,
+      'info',
+      'signaling'
+    );
 
-    // 1. Initialize Browser BroadcastChannel for instant local cross-tab signaling
+    // 1. Supabase Realtime Transport
+    try {
+      this.supabaseTransport = new SupabaseSignalingTransport(
+        this.channelName,
+        this.clientId,
+        (event, payload) => {
+          this.handleIncomingRawMessage({ type: event, payload, from: payload.senderId }, 'supabase');
+        },
+        (entry) => this.onLogCallback?.(entry)
+      );
+    } catch (e: any) {
+      this.log(`Supabase Realtime transport init exception: ${e.message}`, 'warn', 'signaling');
+    }
+
+    // 2. Browser BroadcastChannel (0ms local cross-tab signaling)
     if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
       try {
-        const channelName = `vlab_sig_${this.sessionId}`;
-        this.broadcastChannel = new BroadcastChannel(channelName);
+        this.broadcastChannel = new BroadcastChannel(this.channelName);
         this.broadcastChannel.onmessage = (e) => {
           if (e.data && e.data.from !== this.clientId) {
             this.handleIncomingRawMessage(e.data, 'broadcast');
           }
         };
-        this.log(`BroadcastChannel active: ${channelName}`, 'info', 'signaling');
+        this.log(`BroadcastChannel connected: ${this.channelName}`, 'info', 'signaling');
       } catch (err: any) {
         this.log(`BroadcastChannel failed: ${err.message}`, 'warn', 'signaling');
       }
     }
 
-    // 2. Initialize Socket.IO connection
+    // 3. Socket.IO (Local development server)
     if (typeof window !== 'undefined') {
       try {
         this.socket = io({
           transports: ['websocket', 'polling'],
-          timeout: 5000,
-          reconnectionAttempts: 5
+          timeout: 4000,
+          reconnectionAttempts: 3
         });
 
         this.socket.on('connect', () => {
-          this.isConnected = true;
           this.log(`Socket.IO connected (${this.socket?.id})`, 'success', 'signaling');
           this.socket?.emit('join_session', {
-            sessionId: this.sessionId,
+            sessionId: this.canonicalRoomId,
             user: { id: this.clientId, role: this.role }
           });
         });
 
-        this.socket.on('connect_error', (err) => {
-          this.log(`Socket.IO connect error: ${err.message} (using HTTP / Broadcast fallback)`, 'warn', 'signaling');
-        });
-
-        // Forward inbound socket events
         const socketEvents = [
           'webrtc_offer',
           'webrtc_answer',
           'webrtc_ice_candidate',
           'student_screen_status',
           'student_raise_hand',
-          'student_lower_hand',
-          'student_leave_lab',
-          'participants_list_updated'
+          'student_lower_hand'
         ];
 
         socketEvents.forEach(evt => {
@@ -143,7 +165,7 @@ export class UnifiedSignalingClient {
         this.log(`Socket init exception: ${e.message}`, 'warn', 'signaling');
       }
 
-      // 3. Start Polling Fallback to /api/signaling (supports Vercel serverless)
+      // 4. Next.js API /api/signaling Fast Polling (Supports Vercel serverless)
       this.startPollingFallback();
     }
   }
@@ -151,7 +173,7 @@ export class UnifiedSignalingClient {
   private startPollingFallback() {
     this.pollingTimer = setInterval(async () => {
       try {
-        const url = `/api/signaling?sessionId=${encodeURIComponent(this.sessionId)}&clientId=${encodeURIComponent(this.clientId)}&role=${this.role}&since=${this.lastPolledTimestamp}`;
+        const url = `/api/signaling?sessionId=${encodeURIComponent(this.canonicalRoomId)}&clientId=${encodeURIComponent(this.clientId)}&role=${this.role}&since=${this.lastPolledTimestamp}`;
         const res = await fetch(url);
         if (res.ok) {
           const data = await res.json();
@@ -160,28 +182,25 @@ export class UnifiedSignalingClient {
           }
           if (Array.isArray(data.messages)) {
             for (const msg of data.messages) {
-              this.handleIncomingRawMessage(msg, 'polling');
+              this.handleIncomingRawMessage(msg, 'api_polling');
             }
           }
         }
-      } catch (err) {
-        // Silent polling error handling
-      }
-    }, 1200);
+      } catch (err) {}
+    }, 650); // Polling every 650ms for responsive signaling
   }
 
-  private handleIncomingRawMessage(msg: any, source: string) {
+  public handleIncomingRawMessage(msg: any, source: string) {
     if (!msg || !msg.type) return;
 
     // Deduplicate messages across transports
-    const msgKey = msg.id || `${msg.type}_${msg.from}_${JSON.stringify(msg.payload || {}).slice(0, 40)}`;
+    const msgKey = msg.id || `${msg.type}_${msg.from}_${JSON.stringify(msg.payload || {}).slice(0, 30)}`;
     if (this.processedMessageIds.has(msgKey)) {
       return;
     }
     this.processedMessageIds.add(msgKey);
 
-    // Limit deduplication cache size
-    if (this.processedMessageIds.size > 200) {
+    if (this.processedMessageIds.size > 300) {
       const first = Array.from(this.processedMessageIds)[0];
       this.processedMessageIds.delete(first);
     }
@@ -189,16 +208,30 @@ export class UnifiedSignalingClient {
     const eventName = msg.type;
     const payload = msg.payload || msg;
 
-    this.log(`Received ${eventName} from ${msg.from || payload.studentId || 'peer'} via ${source}`, 'info', 'signaling');
+    // Log explicit WebRTC signaling milestones
+    if (eventName === 'webrtc_offer' && this.role === 'instructor') {
+      this.log(`[4. Offer received] Received WebRTC offer from student via ${source}`, 'success', 'signaling', {
+        studentId: payload.studentId,
+        sdpType: payload.offer?.type
+      });
+    } else if (eventName === 'webrtc_answer' && this.role === 'student') {
+      this.log(`[7. Answer received] Received WebRTC answer from instructor via ${source}`, 'success', 'signaling', {
+        sdpType: payload.answer?.type
+      });
+    } else if (eventName === 'webrtc_ice_candidate') {
+      this.log(`[9. ICE candidate received] Received ICE candidate from peer via ${source}`, 'info', 'ice', {
+        type: payload.candidate?.type || 'candidate'
+      });
+    }
 
-    // Notify registered listeners
+    // Trigger registered event callbacks
     const handlers = this.listeners.get(eventName);
     if (handlers) {
       handlers.forEach(fn => {
         try {
           fn(payload);
         } catch (e: any) {
-          this.log(`Error in listener for ${eventName}: ${e.message}`, 'error', 'signaling');
+          this.log(`Listener error on ${eventName}: ${e.message}`, 'error', 'signaling');
         }
       });
     }
@@ -226,12 +259,14 @@ export class UnifiedSignalingClient {
       msgId,
       senderId: this.clientId,
       senderRole: this.role,
-      sessionId: this.sessionId
+      sessionId: this.canonicalRoomId,
+      rawSessionId: this.rawSessionId
     };
 
     const envelope = {
       id: msgId,
-      sessionId: this.sessionId,
+      sessionId: this.canonicalRoomId,
+      canonicalRoomId: this.canonicalRoomId,
       from: this.clientId,
       to,
       type,
@@ -239,23 +274,35 @@ export class UnifiedSignalingClient {
       timestamp: Date.now()
     };
 
-    this.log(`Sending ${type} to ${to}`, 'info', 'signaling');
+    // Log explicit WebRTC sending milestones
+    if (type === 'webrtc_offer') {
+      this.log(`[3. Offer sent] WebRTC offer sent to instructor on channel ${this.channelName}`, 'success', 'signaling');
+    } else if (type === 'webrtc_answer') {
+      this.log(`[6. Answer sent] WebRTC answer sent to student on channel ${this.channelName}`, 'success', 'signaling');
+    } else if (type === 'webrtc_ice_candidate') {
+      this.log(`[8. ICE candidate generated] Sent local ICE candidate to peer`, 'info', 'ice');
+    }
 
-    // 1. Send via BroadcastChannel (local 0ms inter-tab)
+    // 1. Supabase Realtime Transport
+    if (this.supabaseTransport) {
+      this.supabaseTransport.send(type, enrichedPayload);
+    }
+
+    // 2. BroadcastChannel Transport (0ms local inter-tab)
     if (this.broadcastChannel) {
       try {
         this.broadcastChannel.postMessage(envelope);
       } catch (e) {}
     }
 
-    // 2. Send via Socket.IO if connected
+    // 3. Socket.IO Transport
     if (this.socket && this.socket.connected) {
       try {
         this.socket.emit(type, enrichedPayload);
       } catch (e) {}
     }
 
-    // 3. Send via Next.js API /api/signaling (for Vercel serverless cross-device)
+    // 4. Next.js API /api/signaling Transport
     fetch('/api/signaling', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -263,8 +310,20 @@ export class UnifiedSignalingClient {
     }).catch(() => {});
   }
 
+  public getTransportStatus() {
+    return {
+      rawSessionId: this.rawSessionId,
+      canonicalRoomId: this.canonicalRoomId,
+      channelName: this.channelName,
+      supabase: this.supabaseTransport?.getStatus() || 'NOT_CONFIGURED',
+      broadcastChannel: this.broadcastChannel ? 'ACTIVE' : 'INACTIVE',
+      socket: this.socket?.connected ? 'CONNECTED' : 'OFFLINE',
+      apiPolling: this.pollingTimer ? 'ACTIVE' : 'INACTIVE'
+    };
+  }
+
   public destroy() {
-    this.log('Tearing down signaling channel', 'warn', 'signaling');
+    this.log('Tearing down signaling channel', 'info', 'signaling');
     if (this.pollingTimer) {
       clearInterval(this.pollingTimer);
       this.pollingTimer = null;
@@ -276,6 +335,10 @@ export class UnifiedSignalingClient {
     if (this.socket) {
       this.socket.disconnect();
       this.socket = null;
+    }
+    if (this.supabaseTransport) {
+      this.supabaseTransport.destroy();
+      this.supabaseTransport = null;
     }
     this.listeners.clear();
   }
