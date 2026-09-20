@@ -18,6 +18,7 @@ export interface LabSession {
   startTime: string;
   endTime?: string;
   isActive: boolean;
+  instructorName?: string;
   createdAt: string;
   joinedCount?: number;
 }

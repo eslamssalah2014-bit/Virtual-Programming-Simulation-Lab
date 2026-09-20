@@ -1,128 +1,412 @@
 'use client';
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, Suspense } from 'react';
 import { useParams } from 'next/navigation';
-import Link from 'next/link';
-import { useAuth } from '@/lib/context/AuthContext';
-import { getSocket } from '@/lib/socket/client';
 import { LabSession, LabParticipant } from '@/types';
 import {
-  ArrowLeft,
+  UnifiedSignalingClient,
+  RTC_CONFIGURATION,
+  WebRTCLogEntry
+} from '@/lib/webrtc/signalingClient';
+import { WebRTCDebugPanel, WebRTCDebugInfo } from '@/components/common/WebRTCDebugPanel';
+import {
+  Users,
   Monitor,
   Radio,
   Hand,
-  Users,
-  Copy,
-  Check,
-  Search,
   Maximize2,
   X,
   FileSpreadsheet,
   Download,
-  AlertTriangle,
-  Clock,
+  Copy,
+  Check,
   ChevronLeft,
   ChevronRight,
-  ExternalLink,
-  ShieldCheck,
-  Sparkles
+  AlertTriangle,
+  Search,
+  Activity,
+  Video
 } from 'lucide-react';
 
-export default function ClassroomMonitoringPage() {
+function InstructorLiveSessionContent() {
   const params = useParams();
   const sessionId = (params?.sessionId as string) || 'session-101';
-  const { currentUser } = useAuth();
 
   const [session, setSession] = useState<LabSession | null>(null);
   const [participants, setParticipants] = useState<LabParticipant[]>([]);
   const [focusedParticipant, setFocusedParticipant] = useState<LabParticipant | null>(null);
-  const [isAttendanceModalOpen, setIsAttendanceModalOpen] = useState(false);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [copied, setCopied] = useState(false);
+  const [activeTab, setActiveTab] = useState<'screens' | 'attendance'>('screens');
   const [statusFilter, setStatusFilter] = useState<'all' | 'sharing' | 'hands'>('all');
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [copied, setCopied] = useState<boolean>(false);
+  const [isAttendanceModalOpen, setIsAttendanceModalOpen] = useState<boolean>(false);
 
-  // Load session and participants
-  const loadData = () => {
+  // WebRTC Multi-Peer State
+  const [remoteStreams, setRemoteStreams] = useState<Record<string, MediaStream>>({});
+  const [peerStates, setPeerStates] = useState<Record<string, {
+    connectionState: string;
+    iceState: string;
+    streamId?: string;
+    trackCount: number;
+  }>>({});
+  const [logs, setLogs] = useState<WebRTCLogEntry[]>([]);
+
+  const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const signalingRef = useRef<UnifiedSignalingClient | null>(null);
+  const focusVideoRef = useRef<HTMLVideoElement | null>(null);
+
+  const addLog = (entry: WebRTCLogEntry) => {
+    setLogs(prev => [entry, ...prev.slice(0, 249)]);
+  };
+
+  // 1. Fetch initial session and participants data
+  useEffect(() => {
     fetch(`/api/sessions/${sessionId}`)
-      .then(r => r.json())
+      .then(res => res.json())
       .then(data => {
         if (data.session) setSession(data.session);
         if (Array.isArray(data.participants)) setParticipants(data.participants);
       })
       .catch(err => console.error('Failed to load session:', err));
-  };
+  }, [sessionId]);
 
+  // 2. Setup Unified WebRTC Signaling for Instructor
   useEffect(() => {
-    loadData();
+    const signaling = new UnifiedSignalingClient(sessionId, 'instructor', 'instructor', addLog);
+    signalingRef.current = signaling;
 
-    const socket = getSocket();
-    socket.emit('join_session', { sessionId, user: currentUser });
+    signaling.log(
+      `[Instructor Connected] Monitoring station ready for session: ${sessionId}`,
+      'success',
+      'signaling'
+    );
 
-    const handleParticipantsListUpdated = (list: LabParticipant[]) => {
-      setParticipants(list);
-      setFocusedParticipant(prev => {
-        if (!prev) return null;
-        return list.find(p => p.studentId === prev.studentId) || prev;
-      });
-    };
+    // Notify presence
+    signaling.send('join_session', 'all', {
+      sessionId,
+      user: { id: 'instructor', role: 'instructor' }
+    });
 
-    const handleParticipantUpdated = (updated: LabParticipant) => {
-      setParticipants(prev =>
-        prev.map(p => (p.studentId === updated.studentId ? updated : p))
+    // Handle student joining
+    signaling.on('join_session', (data: any) => {
+      if (data.studentId && data.studentId !== 'instructor') {
+        signaling.log(
+          `[Student Connected] Student joined lab: ${data.studentName || 'Student'} (${data.studentId})`,
+          'info',
+          'signaling'
+        );
+
+        setParticipants(prev => {
+          const exists = prev.find(p => p.studentId === data.studentId || p.studentRegistrationId === data.studentRegistrationId);
+          if (exists) {
+            return prev.map(p => p.studentId === data.studentId ? { ...p, status: 'Active' } : p);
+          }
+          const newP: LabParticipant = {
+            studentId: data.studentId,
+            studentName: data.studentName || 'New Student',
+            studentRegistrationId: data.studentRegistrationId || data.studentId,
+            studentEmail: `${data.studentId.toLowerCase()}@student.edu`,
+            status: 'Active',
+            isScreenSharing: false,
+            isHandRaised: false,
+            joinTime: new Date().toISOString(),
+            timeInLabSeconds: 0,
+            screenShareDurationSeconds: 0,
+            lastActivity: 'Joined lab session',
+            lastActivityTime: new Date().toISOString()
+          };
+          return [...prev, newP];
+        });
+      }
+    });
+
+    // Handle incoming WebRTC Offer from Student
+    signaling.on('webrtc_offer', async (data: any) => {
+      const { studentId, studentName, studentRegistrationId, offer } = data;
+      if (!studentId || !offer) return;
+
+      signaling.log(
+        `[Offer Received] Received WebRTC SDP offer from student: ${studentName || studentId}`,
+        'success',
+        'signaling',
+        { sdpType: offer.type }
       );
-      setFocusedParticipant(prev => {
-        if (prev && prev.studentId === updated.studentId) return updated;
-        return prev;
-      });
-    };
 
-    socket.on('participants_list_updated', handleParticipantsListUpdated);
-    socket.on('participant_updated', handleParticipantUpdated);
+      // Close previous connection for this student if one exists
+      const existingPc = peerConnectionsRef.current.get(studentId);
+      if (existingPc) {
+        signaling.log(`Closing previous RTCPeerConnection for student ${studentId}`, 'info', 'webrtc');
+        existingPc.close();
+      }
+
+      // Create new RTCPeerConnection
+      const pc = new RTCPeerConnection(RTC_CONFIGURATION);
+      peerConnectionsRef.current.set(studentId, pc);
+
+      const updatePeerInfo = () => {
+        setPeerStates(prev => ({
+          ...prev,
+          [studentId]: {
+            connectionState: pc.connectionState,
+            iceState: pc.iceConnectionState,
+            streamId: (pc as any).getRemoteStreams?.()[0]?.id || `stream-${studentId}`,
+            trackCount: pc.getReceivers().length
+          }
+        }));
+      };
+
+      pc.onconnectionstatechange = () => {
+        const state = pc.connectionState;
+        updatePeerInfo();
+        signaling.log(
+          `[WebRTC Connection State Changed] Student ${studentName || studentId}: ${state}`,
+          state === 'connected' ? 'success' : state === 'failed' ? 'error' : 'info',
+          'webrtc'
+        );
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        const state = pc.iceConnectionState;
+        updatePeerInfo();
+        signaling.log(
+          `[ICE Connection State Changed] Student ${studentName || studentId}: ${state}`,
+          state === 'connected' || state === 'completed' ? 'success' : state === 'failed' ? 'error' : 'info',
+          'ice'
+        );
+      };
+
+      // Send local ICE candidate to student
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          signaling.log(
+            `[ICE Candidate Exchange] Generated candidate for student ${studentName || studentId}, sending back`,
+            'info',
+            'ice'
+          );
+          signaling.send('webrtc_ice_candidate', studentId, {
+            sessionId,
+            studentId,
+            targetId: studentId,
+            candidate: event.candidate,
+            fromRole: 'instructor'
+          });
+        }
+      };
+
+      // Critical: ontrack receives the remote screen video stream from the student!
+      pc.ontrack = (event) => {
+        const remoteStream = event.streams[0] || new MediaStream([event.track]);
+        signaling.log(
+          `[Remote Stream Received] ontrack fired for student: ${studentName || studentId}! Stream ID: ${remoteStream.id}, Tracks: ${remoteStream.getTracks().length}`,
+          'success',
+          'webrtc'
+        );
+
+        setRemoteStreams(prev => ({
+          ...prev,
+          [studentId]: remoteStream
+        }));
+
+        // Update participant active status
+        setParticipants(prev =>
+          prev.map(p => {
+            if (p.studentId === studentId || p.studentRegistrationId === studentRegistrationId) {
+              return {
+                ...p,
+                isScreenSharing: true,
+                status: 'Active',
+                lastActivity: 'Sharing desktop live'
+              };
+            }
+            return p;
+          })
+        );
+
+        updatePeerInfo();
+      };
+
+      try {
+        // Set remote description from student offer
+        await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        signaling.log(`[Remote Description Set] Applied offer from student ${studentName || studentId}`, 'info', 'webrtc');
+
+        // Create WebRTC Answer
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        signaling.log(`[Answer Created] Created WebRTC answer for student ${studentName || studentId}`, 'success', 'webrtc');
+
+        // Send Answer back to Student
+        signaling.send('webrtc_answer', studentId, {
+          sessionId,
+          studentId,
+          targetId: studentId,
+          answer
+        });
+        signaling.log(`[Answer Sent] Dispatched WebRTC answer to student ${studentName || studentId}`, 'success', 'signaling');
+      } catch (err: any) {
+        signaling.log(`[WebRTC Error] Failed processing offer from student ${studentId}: ${err.message}`, 'error', 'webrtc');
+      }
+    });
+
+    // Handle incoming ICE candidates from Student
+    signaling.on('webrtc_ice_candidate', async (data: any) => {
+      if (data.fromRole === 'instructor') return;
+      const { studentId, candidate } = data;
+      if (!studentId || !candidate) return;
+
+      const pc = peerConnectionsRef.current.get(studentId);
+      if (pc) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+          signaling.log(
+            `[ICE Candidate Exchange] Applied ICE candidate from student ${studentId}`,
+            'info',
+            'ice'
+          );
+        } catch (err: any) {
+          signaling.log(`[ICE Error] Failed to add candidate from student ${studentId}: ${err.message}`, 'warn', 'ice');
+        }
+      }
+    });
+
+    // Handle student screen status change
+    signaling.on('student_screen_status', (data: any) => {
+      const { studentId, isScreenSharing } = data;
+      signaling.log(`Student ${studentId} screen status: ${isScreenSharing ? 'Active' : 'Stopped'}`, 'info', 'media');
+
+      if (!isScreenSharing) {
+        const pc = peerConnectionsRef.current.get(studentId);
+        if (pc) {
+          pc.close();
+          peerConnectionsRef.current.delete(studentId);
+        }
+        setRemoteStreams(prev => {
+          const next = { ...prev };
+          delete next[studentId];
+          return next;
+        });
+      }
+
+      setParticipants(prev =>
+        prev.map(p =>
+          p.studentId === studentId
+            ? { ...p, isScreenSharing, lastActivity: isScreenSharing ? 'Sharing screen' : 'Screen paused' }
+            : p
+        )
+      );
+    });
+
+    // Handle Raise Hand
+    signaling.on('student_raise_hand', (data: any) => {
+      const { studentId, message } = data;
+      signaling.log(`[Hand Raised Alert] Student ${studentId} raised hand. Message: ${message || 'None'}`, 'warn', 'signaling');
+
+      setParticipants(prev =>
+        prev.map(p =>
+          p.studentId === studentId
+            ? {
+                ...p,
+                isHandRaised: true,
+                helpRequest: message ? { id: `help-${Date.now()}`, sessionId, studentId, message, status: 'pending', requestedAt: new Date().toISOString() } : null
+              }
+            : p
+        )
+      );
+    });
+
+    // Handle Lower Hand
+    signaling.on('student_lower_hand', (data: any) => {
+      const { studentId } = data;
+      setParticipants(prev =>
+        prev.map(p => (p.studentId === studentId ? { ...p, isHandRaised: false, helpRequest: null } : p))
+      );
+    });
+
+    // Handle Student Leaving Lab
+    signaling.on('student_leave_lab', (data: any) => {
+      const { studentId } = data;
+      signaling.log(`Student ${studentId} left the lab`, 'info', 'signaling');
+
+      const pc = peerConnectionsRef.current.get(studentId);
+      if (pc) {
+        pc.close();
+        peerConnectionsRef.current.delete(studentId);
+      }
+      setRemoteStreams(prev => {
+        const next = { ...prev };
+        delete next[studentId];
+        return next;
+      });
+
+      setParticipants(prev =>
+        prev.map(p =>
+          p.studentId === studentId
+            ? { ...p, status: 'Left', isScreenSharing: false, isHandRaised: false, leaveTime: new Date().toISOString() }
+            : p
+        )
+      );
+    });
 
     return () => {
-      socket.off('participants_list_updated', handleParticipantsListUpdated);
-      socket.off('participant_updated', handleParticipantUpdated);
+      peerConnectionsRef.current.forEach(pc => pc.close());
+      peerConnectionsRef.current.clear();
+      signaling.destroy();
+      signalingRef.current = null;
     };
-  }, [sessionId, currentUser]);
+  }, [sessionId]);
 
+  // Focus Mode Video Attachment: video.srcObject = remoteStream
+  useEffect(() => {
+    if (focusVideoRef.current) {
+      if (focusedParticipant && remoteStreams[focusedParticipant.studentId]) {
+        focusVideoRef.current.srcObject = remoteStreams[focusedParticipant.studentId];
+        focusVideoRef.current.play().catch(e => console.log('Autoplay error:', e));
+      } else {
+        focusVideoRef.current.srcObject = null;
+      }
+    }
+  }, [focusedParticipant, remoteStreams]);
+
+  // Lower Hand action by instructor
+  const handleLowerHand = (studentId: string) => {
+    signalingRef.current?.send('instructor_resolve_help', studentId, {
+      sessionId,
+      studentId
+    });
+
+    setParticipants(prev =>
+      prev.map(p => (p.studentId === studentId ? { ...p, isHandRaised: false, helpRequest: null } : p))
+    );
+  };
+
+  // Copy Session Link
   const handleCopyLink = () => {
-    if (typeof window === 'undefined' || !session) return;
-    const url = `${window.location.origin}/join/${session.sessionCode || session.id}`;
-    navigator.clipboard.writeText(url);
+    const link = `${window.location.origin}/join/${session?.sessionCode || sessionId}`;
+    navigator.clipboard.writeText(link);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const handleLowerHand = (studentId: string) => {
-    const socket = getSocket();
-    socket.emit('instructor_resolve_help', { sessionId, studentId });
-  };
-
-  // Metrics
-  const totalCount = participants.length;
-  const sharingCount = participants.filter(p => p.isScreenSharing).length;
-  const handsRaisedCount = participants.filter(p => p.isHandRaised).length;
-
+  // Filtered Participants
   const filteredParticipants = participants.filter(p => {
-    const matchesSearch =
-      (p.studentName || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (p.studentRegistrationId || '').toLowerCase().includes(searchQuery.toLowerCase());
+    if (statusFilter === 'sharing' && !p.isScreenSharing) return false;
+    if (statusFilter === 'hands' && !p.isHandRaised) return false;
 
-    if (statusFilter === 'sharing') return matchesSearch && p.isScreenSharing;
-    if (statusFilter === 'hands') return matchesSearch && p.isHandRaised;
-    return matchesSearch;
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      return (
+        p.studentName.toLowerCase().includes(q) ||
+        p.studentRegistrationId.toLowerCase().includes(q) ||
+        p.studentId.toLowerCase().includes(q)
+      );
+    }
+    return true;
   });
 
-  // Focus navigation
+  // Focus Navigation
   const currentIndex = focusedParticipant
     ? filteredParticipants.findIndex(p => p.studentId === focusedParticipant.studentId)
     : -1;
-
-  const handleNextFocus = () => {
-    if (currentIndex >= 0 && currentIndex < filteredParticipants.length - 1) {
-      setFocusedParticipant(filteredParticipants[currentIndex + 1]);
-    }
-  };
 
   const handlePrevFocus = () => {
     if (currentIndex > 0) {
@@ -130,223 +414,231 @@ export default function ClassroomMonitoringPage() {
     }
   };
 
+  const handleNextFocus = () => {
+    if (currentIndex < filteredParticipants.length - 1 && currentIndex !== -1) {
+      setFocusedParticipant(filteredParticipants[currentIndex + 1]);
+    }
+  };
+
+  // Stat Counters
+  const totalCount = participants.length;
+  const sharingCount = participants.filter(p => p.isScreenSharing).length;
+  const handsRaisedCount = participants.filter(p => p.isHandRaised).length;
+
+  // Selected Student Debug Info for panel
+  const activeFocusPeerState = focusedParticipant ? peerStates[focusedParticipant.studentId] : undefined;
+  const debugInfo: WebRTCDebugInfo = {
+    role: 'instructor',
+    screenSharingStatus: sharingCount > 0,
+    streamId: focusedParticipant ? remoteStreams[focusedParticipant.studentId]?.id : Object.values(remoteStreams)[0]?.id,
+    trackCount: Object.keys(remoteStreams).length,
+    peerConnectionState: activeFocusPeerState?.connectionState || (sharingCount > 0 ? 'connected' : 'new'),
+    iceConnectionState: activeFocusPeerState?.iceState || (sharingCount > 0 ? 'connected' : 'new'),
+    remoteStreamStatus: `${Object.keys(remoteStreams).length} Live Streams Connected`
+  };
+
   return (
-    <div className="min-h-[calc(100vh-3.5rem)] bg-[#0d1117] text-gray-100 p-6 flex flex-col">
-      <div className="max-w-7xl mx-auto w-full space-y-6 flex-1 flex flex-col">
-        {/* Session Top Bar */}
-        <div className="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-gray-800">
-          <div className="flex items-center space-x-3">
-            <Link
-              href="/"
-              className="p-2 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 transition"
-              title="Back to Sessions Dashboard"
-            >
-              <ArrowLeft className="w-4 h-4" />
-            </Link>
-
-            <div>
-              <div className="flex items-center space-x-2.5">
-                <span className="font-mono text-xs font-bold px-2 py-0.5 rounded bg-gray-800 border border-gray-700 text-gray-200">
-                  {session?.groupCode || 'LAB-1'}
-                </span>
-                <h1 className="text-xl font-bold text-white tracking-tight">
-                  {session?.sessionTitle || session?.groupName || 'Classroom Computer Lab'}
-                </h1>
-                <span className="inline-flex items-center text-xs text-emerald-400 font-semibold px-2 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/20">
-                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse mr-1.5" />
-                  Live Monitoring
-                </span>
-              </div>
-              <div className="text-xs text-gray-400 mt-0.5">
-                {session?.groupName || 'Computer Room'} • Session Code:{' '}
-                <span className="font-mono text-gray-200 font-semibold">
-                  {session?.sessionCode || session?.id}
-                </span>
-              </div>
-            </div>
-          </div>
-
-          <div className="flex items-center space-x-2.5">
-            {/* View Attendance Report Button */}
-            <button
-              onClick={() => setIsAttendanceModalOpen(true)}
-              className="bg-gray-800 hover:bg-gray-700 text-gray-200 border border-gray-700 px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition"
-            >
-              <FileSpreadsheet className="w-4 h-4 text-emerald-400" />
-              <span>Attendance Sheet</span>
-            </button>
-
-            {/* Copy Student Join Link Button */}
-            <button
-              onClick={handleCopyLink}
-              className="bg-emerald-600 hover:bg-emerald-500 text-white px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition shadow-xs"
-            >
-              {copied ? (
-                <>
-                  <Check className="w-4 h-4" />
-                  <span>Join Link Copied!</span>
-                </>
-              ) : (
-                <>
-                  <Copy className="w-4 h-4" />
-                  <span>Copy Student Link</span>
-                </>
-              )}
-            </button>
-          </div>
-        </div>
-
-        {/* Hand Raised Priority Banner */}
-        {handsRaisedCount > 0 && (
-          <div className="bg-amber-950/40 border border-amber-500/40 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3 shadow-md">
-            <div className="flex items-center space-x-3">
-              <div className="w-9 h-9 rounded-lg bg-amber-500/20 text-amber-400 flex items-center justify-center">
-                <Hand className="w-5 h-5 animate-bounce" />
-              </div>
-              <div>
-                <h4 className="font-bold text-amber-200 text-sm">
-                  {handsRaisedCount} Student{handsRaisedCount > 1 ? 's' : ''} Raised Hand
-                </h4>
-                <p className="text-xs text-amber-300/80">
-                  {participants
-                    .filter(p => p.isHandRaised)
-                    .map(p => p.studentName)
-                    .join(', ')}{' '}
-                  waiting for assistance.
-                </p>
-              </div>
-            </div>
-
-            <div className="flex items-center space-x-2">
-              {participants
-                .filter(p => p.isHandRaised)
-                .map(p => (
-                  <button
-                    key={p.studentId}
-                    onClick={() => setFocusedParticipant(p)}
-                    className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-gray-950 font-bold text-xs flex items-center space-x-1.5 transition shadow-sm"
-                  >
-                    <Maximize2 className="w-3.5 h-3.5" />
-                    <span>Focus {p.studentName.split(' ')[0]}</span>
-                  </button>
-                ))}
-            </div>
-          </div>
-        )}
-
-        {/* Stat Overview Cards */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-          <div className="bg-[#161b22] border border-gray-800 rounded-xl p-4 flex items-center space-x-3.5">
-            <div className="w-10 h-10 rounded-lg bg-blue-500/10 text-blue-400 flex items-center justify-center">
-              <Users className="w-5 h-5" />
-            </div>
-            <div>
-              <div className="text-xs font-medium text-gray-400 uppercase tracking-wider">
-                Joined Stations
-              </div>
-              <div className="text-2xl font-bold text-white mt-0.5">{totalCount}</div>
-            </div>
-          </div>
-
-          <div className="bg-[#161b22] border border-gray-800 rounded-xl p-4 flex items-center space-x-3.5">
-            <div className="w-10 h-10 rounded-lg bg-emerald-500/10 text-emerald-400 flex items-center justify-center">
-              <Radio className="w-5 h-5" />
-            </div>
-            <div>
-              <div className="text-xs font-medium text-gray-400 uppercase tracking-wider flex items-center space-x-1.5">
-                <span>Sharing Screens</span>
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-              </div>
-              <div className="text-2xl font-bold text-emerald-400 mt-0.5">{sharingCount}</div>
-            </div>
-          </div>
-
-          <div className="bg-[#161b22] border border-gray-800 rounded-xl p-4 flex items-center space-x-3.5">
-            <div className="w-10 h-10 rounded-lg bg-amber-500/10 text-amber-400 flex items-center justify-center">
-              <Hand className="w-5 h-5" />
-            </div>
-            <div>
-              <div className="text-xs font-medium text-gray-400 uppercase tracking-wider">
-                Hands Raised
-              </div>
-              <div className="text-2xl font-bold text-amber-400 mt-0.5">{handsRaisedCount}</div>
-            </div>
-          </div>
-        </div>
-
-        {/* Multi-Screen Grid Toolbar */}
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 bg-[#161b22] border border-gray-800 p-3.5 rounded-xl">
+    <div className="flex-1 bg-[#0a0d12] flex flex-col p-4 md:p-6 max-w-7xl mx-auto w-full space-y-5">
+      {/* Session Top Banner */}
+      <div className="bg-[#161b22] border border-gray-800 rounded-xl px-5 py-4 flex flex-wrap items-center justify-between gap-4 shadow-sm">
+        <div>
           <div className="flex items-center space-x-2">
-            <button
-              onClick={() => setStatusFilter('all')}
-              className={`px-3 py-1 rounded-md text-xs font-semibold transition ${
-                statusFilter === 'all'
-                  ? 'bg-emerald-600 text-white'
-                  : 'text-gray-400 hover:text-white'
-              }`}
-            >
-              All Screens ({totalCount})
-            </button>
-            <button
-              onClick={() => setStatusFilter('sharing')}
-              className={`px-3 py-1 rounded-md text-xs font-semibold transition ${
-                statusFilter === 'sharing'
-                  ? 'bg-emerald-600 text-white'
-                  : 'text-gray-400 hover:text-white'
-              }`}
-            >
-              Sharing Active ({sharingCount})
-            </button>
-            <button
-              onClick={() => setStatusFilter('hands')}
-              className={`px-3 py-1 rounded-md text-xs font-semibold transition ${
-                statusFilter === 'hands'
-                  ? 'bg-amber-600 text-white'
-                  : 'text-gray-400 hover:text-white'
-              }`}
-            >
-              Hands Raised ({handsRaisedCount})
-            </button>
+            <span className="font-mono text-xs font-bold text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
+              {session?.groupCode || 'LAB-1'}
+            </span>
+            <h1 className="text-xl font-bold text-white tracking-tight">
+              {session?.sessionTitle || session?.groupName || 'Classroom Computer Lab'}
+            </h1>
+            <span className="inline-flex items-center text-xs text-emerald-400 font-semibold px-2 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/20">
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse mr-1.5" />
+              <span>Multi-Screen Monitor Active</span>
+            </span>
+          </div>
+          <p className="text-xs text-gray-400 mt-1">
+            Group: <strong className="text-gray-200">{session?.groupName || 'Computer Lab Group'}</strong> • Code:{' '}
+            <strong className="text-cyan-400 font-mono">{session?.sessionCode || sessionId}</strong> • Instructor:{' '}
+            <strong className="text-gray-200">{session?.instructorName || 'Lead Instructor'}</strong>
+          </p>
+        </div>
+
+        {/* Action Buttons */}
+        <div className="flex flex-wrap items-center gap-2.5">
+          <button
+            onClick={() => setIsAttendanceModalOpen(true)}
+            className="bg-gray-800 hover:bg-gray-700 text-gray-200 border border-gray-700 px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition"
+          >
+            <FileSpreadsheet className="w-4 h-4 text-emerald-400" />
+            <span>Attendance Sheet</span>
+          </button>
+
+          <button
+            onClick={handleCopyLink}
+            className="bg-emerald-600 hover:bg-emerald-500 text-white px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition shadow-xs"
+          >
+            {copied ? (
+              <>
+                <Check className="w-4 h-4" />
+                <span>Join Link Copied!</span>
+              </>
+            ) : (
+              <>
+                <Copy className="w-4 h-4" />
+                <span>Copy Student Link</span>
+              </>
+            )}
+          </button>
+        </div>
+      </div>
+
+      {/* Hand Raised Priority Banner */}
+      {handsRaisedCount > 0 && (
+        <div className="bg-amber-950/40 border border-amber-500/40 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3 shadow-md">
+          <div className="flex items-center space-x-3">
+            <div className="w-9 h-9 rounded-lg bg-amber-500/20 text-amber-400 flex items-center justify-center">
+              <Hand className="w-5 h-5 animate-bounce" />
+            </div>
+            <div>
+              <h4 className="font-bold text-amber-200 text-sm">
+                {handsRaisedCount} Student{handsRaisedCount > 1 ? 's' : ''} Raised Hand
+              </h4>
+              <p className="text-xs text-amber-300/80">
+                {participants
+                  .filter(p => p.isHandRaised)
+                  .map(p => p.studentName)
+                  .join(', ')}{' '}
+                waiting for assistance.
+              </p>
+            </div>
           </div>
 
-          <div className="relative w-full sm:w-64">
-            <Search className="w-3.5 h-3.5 text-gray-500 absolute left-3 top-2.5" />
-            <input
-              type="text"
-              placeholder="Search station or student..."
-              value={searchQuery}
-              onChange={e => setSearchQuery(e.target.value)}
-              className="w-full bg-[#0d1117] border border-gray-700 rounded-lg pl-8 pr-3 py-1.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-gray-600"
-            />
+          <div className="flex items-center space-x-2">
+            {participants
+              .filter(p => p.isHandRaised)
+              .map(p => (
+                <button
+                  key={p.studentId}
+                  onClick={() => setFocusedParticipant(p)}
+                  className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-gray-950 font-bold text-xs flex items-center space-x-1.5 transition shadow-sm"
+                >
+                  <Maximize2 className="w-3.5 h-3.5" />
+                  <span>Focus {p.studentName.split(' ')[0]}</span>
+                </button>
+              ))}
+          </div>
+        </div>
+      )}
+
+      {/* Stat Overview Cards */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <div className="bg-[#161b22] border border-gray-800 rounded-xl p-4 flex items-center space-x-3.5">
+          <div className="w-10 h-10 rounded-lg bg-blue-500/10 text-blue-400 flex items-center justify-center">
+            <Users className="w-5 h-5" />
+          </div>
+          <div>
+            <div className="text-xs font-medium text-gray-400 uppercase tracking-wider">Joined Stations</div>
+            <div className="text-2xl font-bold text-white mt-0.5">{totalCount}</div>
           </div>
         </div>
 
-        {/* Live Multi-Screen Gallery */}
-        {filteredParticipants.length === 0 ? (
-          <div className="p-16 text-center bg-[#161b22] border border-gray-800 rounded-2xl space-y-3">
-            <Monitor className="w-10 h-10 text-gray-600 mx-auto" />
-            <h3 className="text-base font-bold text-gray-300">No student screens found</h3>
-            <p className="text-xs text-gray-500 max-w-sm mx-auto">
-              Students who open the lab join link will appear in this screen gallery live.
-            </p>
+        <div className="bg-[#161b22] border border-gray-800 rounded-xl p-4 flex items-center space-x-3.5">
+          <div className="w-10 h-10 rounded-lg bg-emerald-500/10 text-emerald-400 flex items-center justify-center">
+            <Radio className="w-5 h-5 animate-pulse" />
           </div>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-            {filteredParticipants.map(participant => (
-              <StudentScreenTile
-                key={participant.studentId}
-                participant={participant}
-                onFocus={() => setFocusedParticipant(participant)}
-                onLowerHand={() => handleLowerHand(participant.studentId)}
-              />
-            ))}
+          <div>
+            <div className="text-xs font-medium text-gray-400 uppercase tracking-wider">Streaming Live Screens</div>
+            <div className="text-2xl font-bold text-emerald-400 mt-0.5 font-mono">
+              {sharingCount} / {totalCount}
+            </div>
           </div>
-        )}
+        </div>
+
+        <div className="bg-[#161b22] border border-gray-800 rounded-xl p-4 flex items-center space-x-3.5">
+          <div className="w-10 h-10 rounded-lg bg-amber-500/10 text-amber-400 flex items-center justify-center">
+            <Hand className="w-5 h-5" />
+          </div>
+          <div>
+            <div className="text-xs font-medium text-gray-400 uppercase tracking-wider">Help Requests / Hands</div>
+            <div className="text-2xl font-bold text-amber-400 mt-0.5">{handsRaisedCount}</div>
+          </div>
+        </div>
       </div>
+
+      {/* Filter and Search Bar */}
+      <div className="flex flex-wrap items-center justify-between gap-3 bg-[#161b22] border border-gray-800 rounded-xl p-3">
+        <div className="flex items-center space-x-2">
+          <button
+            onClick={() => setStatusFilter('all')}
+            className={`px-3 py-1 rounded-md text-xs font-semibold transition ${
+              statusFilter === 'all' ? 'bg-emerald-600 text-white' : 'text-gray-400 hover:text-white'
+            }`}
+          >
+            All Workstations ({participants.length})
+          </button>
+          <button
+            onClick={() => setStatusFilter('sharing')}
+            className={`px-3 py-1 rounded-md text-xs font-semibold transition ${
+              statusFilter === 'sharing' ? 'bg-emerald-600 text-white' : 'text-gray-400 hover:text-white'
+            }`}
+          >
+            Streaming Screens ({sharingCount})
+          </button>
+          <button
+            onClick={() => setStatusFilter('hands')}
+            className={`px-3 py-1 rounded-md text-xs font-semibold transition ${
+              statusFilter === 'hands' ? 'bg-amber-600 text-white' : 'text-gray-400 hover:text-white'
+            }`}
+          >
+            Hands Raised ({handsRaisedCount})
+          </button>
+        </div>
+
+        <div className="relative w-full sm:w-64">
+          <Search className="w-3.5 h-3.5 text-gray-500 absolute left-3 top-2.5" />
+          <input
+            type="text"
+            placeholder="Search station or student..."
+            value={searchQuery}
+            onChange={e => setSearchQuery(e.target.value)}
+            className="w-full bg-[#0d1117] border border-gray-700 rounded-lg pl-8 pr-3 py-1.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-gray-600"
+          />
+        </div>
+      </div>
+
+      {/* Live Multi-Screen Gallery */}
+      {filteredParticipants.length === 0 ? (
+        <div className="p-16 text-center bg-[#161b22] border border-gray-800 rounded-2xl space-y-3">
+          <Monitor className="w-10 h-10 text-gray-600 mx-auto" />
+          <h3 className="text-base font-bold text-gray-300">No student screens found</h3>
+          <p className="text-xs text-gray-500 max-w-sm mx-auto">
+            Students who open the lab join link will appear in this screen gallery live.
+          </p>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+          {filteredParticipants.map(participant => (
+            <StudentScreenTile
+              key={participant.studentId}
+              participant={participant}
+              remoteStream={remoteStreams[participant.studentId]}
+              peerState={peerStates[participant.studentId]}
+              onFocus={() => setFocusedParticipant(participant)}
+              onLowerHand={() => handleLowerHand(participant.studentId)}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* WebRTC Diagnostics & Event Log Panel */}
+      <WebRTCDebugPanel
+        debugInfo={debugInfo}
+        logs={logs}
+        onClearLogs={() => setLogs([])}
+        title="Instructor WebRTC Multi-Screen Stream Monitor & Diagnostics"
+      />
 
       {/* FOCUS MODE MODAL: Full Screen Desktop Inspection */}
       {focusedParticipant && (
-        <div className="fixed inset-0 z-50 bg-black/90 backdrop-blur-md flex flex-col p-4 animate-in fade-in zoom-in-95 duration-150">
+        <div className="fixed inset-0 z-50 bg-black/95 backdrop-blur-md flex flex-col p-4 animate-in fade-in zoom-in-95 duration-150">
           {/* Focus Mode Top Header */}
           <div className="bg-[#161b22] border border-gray-700 rounded-t-xl px-5 py-3 flex items-center justify-between">
             <div className="flex items-center space-x-3">
@@ -374,9 +666,24 @@ export default function ClassroomMonitoringPage() {
                   <span>
                     Screen Status:{' '}
                     <strong className={focusedParticipant.isScreenSharing ? 'text-emerald-400' : 'text-gray-400'}>
-                      {focusedParticipant.isScreenSharing ? 'Active Stream' : 'Not Sharing'}
+                      {remoteStreams[focusedParticipant.studentId]
+                        ? 'Live WebRTC Stream'
+                        : focusedParticipant.isScreenSharing
+                        ? 'Active Stream'
+                        : 'Not Sharing'}
                     </strong>
                   </span>
+                  {peerStates[focusedParticipant.studentId] && (
+                    <>
+                      <span>•</span>
+                      <span>
+                        Peer State:{' '}
+                        <strong className="text-cyan-400 font-mono">
+                          {peerStates[focusedParticipant.studentId].connectionState}
+                        </strong>
+                      </span>
+                    </>
+                  )}
                 </div>
               </div>
             </div>
@@ -420,17 +727,27 @@ export default function ClassroomMonitoringPage() {
             </div>
           </div>
 
-          {/* Full-Size Screen View */}
+          {/* Full-Size Screen View Area */}
           <div className="flex-1 bg-black rounded-b-xl border-x border-b border-gray-700 flex flex-col items-center justify-center p-3 relative overflow-hidden">
-            <MockScreenCanvas
-              type={focusedParticipant.mockScreenType || 'desktop'}
-              studentName={focusedParticipant.studentName}
-              studentId={focusedParticipant.studentRegistrationId}
-              isFullSize={true}
-            />
+            {remoteStreams[focusedParticipant.studentId] ? (
+              <video
+                ref={focusVideoRef}
+                autoPlay
+                playsInline
+                controls={false}
+                className="w-full h-full max-h-[82vh] object-contain rounded-lg shadow-2xl bg-black"
+              />
+            ) : (
+              <MockScreenCanvas
+                type={focusedParticipant.mockScreenType || 'desktop'}
+                studentName={focusedParticipant.studentName}
+                studentId={focusedParticipant.studentRegistrationId}
+                isFullSize={true}
+              />
+            )}
 
             {focusedParticipant.helpRequest && (
-              <div className="absolute bottom-6 left-6 right-6 bg-black/80 backdrop-blur-md border border-amber-500/40 rounded-xl p-4 flex items-center justify-between shadow-2xl">
+              <div className="absolute bottom-6 left-6 right-6 bg-black/85 backdrop-blur-md border border-amber-500/40 rounded-xl p-4 flex items-center justify-between shadow-2xl">
                 <div className="flex items-center space-x-2 text-xs text-amber-200">
                   <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
                   <span>
@@ -449,52 +766,52 @@ export default function ClassroomMonitoringPage() {
         </div>
       )}
 
-      {/* ATTENDANCE ROSTER MODAL */}
+      {/* ATTENDANCE SHEET MODAL */}
       {isAttendanceModalOpen && (
-        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-150">
-          <div className="bg-[#161b22] border border-gray-700 rounded-xl w-full max-w-4xl shadow-2xl overflow-hidden flex flex-col max-h-[85vh]">
-            <div className="px-6 py-4 border-b border-gray-800 flex items-center justify-between bg-gray-900/40">
+        <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-[#161b22] border border-gray-700 rounded-2xl max-w-4xl w-full max-h-[85vh] flex flex-col overflow-hidden shadow-2xl">
+            <div className="px-6 py-4 border-b border-gray-800 flex items-center justify-between">
               <div className="flex items-center space-x-2.5">
                 <FileSpreadsheet className="w-5 h-5 text-emerald-400" />
-                <h2 className="font-bold text-white text-base">Classroom Attendance & Session Roster</h2>
+                <h3 className="font-bold text-white text-sm">Computer Lab Session Attendance Sheet</h3>
               </div>
               <div className="flex items-center space-x-2">
                 <a
                   href={`/api/sessions/${sessionId}/attendance?format=csv`}
                   download
-                  className="bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs px-3.5 py-1.5 rounded-lg flex items-center space-x-1.5 transition"
+                  className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold px-3 py-1.5 rounded-lg flex items-center space-x-1.5 transition"
                 >
                   <Download className="w-3.5 h-3.5" />
                   <span>Export CSV</span>
                 </a>
                 <button
                   onClick={() => setIsAttendanceModalOpen(false)}
-                  className="text-gray-400 hover:text-white p-1"
+                  className="p-1 rounded text-gray-400 hover:text-white"
                 >
-                  <X className="w-5 h-5" />
+                  <X className="w-4 h-4" />
                 </button>
               </div>
             </div>
 
-            <div className="p-6 overflow-y-auto flex-1">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-[#11161d] text-gray-400 border-b border-gray-800 uppercase tracking-wider text-[11px]">
+            <div className="flex-1 overflow-y-auto p-4 text-xs">
+              <table className="w-full text-left">
+                <thead className="bg-[#0d1117] text-gray-400 uppercase text-[10px] font-semibold border-b border-gray-800">
                   <tr>
-                    <th className="px-4 py-2.5">Student Name</th>
-                    <th className="px-3 py-2.5">Station ID</th>
+                    <th className="px-3 py-2.5">Student Name</th>
+                    <th className="px-3 py-2.5">Student ID</th>
                     <th className="px-3 py-2.5">Join Time</th>
                     <th className="px-3 py-2.5">Leave Time</th>
                     <th className="px-3 py-2.5">Screen Status</th>
-                    <th className="px-3 py-2.5">Duration</th>
+                    <th className="px-3 py-2.5">Total In Lab</th>
                     <th className="px-3 py-2.5">Hand Raised</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-gray-800/80">
+                <tbody className="divide-y divide-gray-800 font-sans">
                   {participants.map(p => (
                     <tr key={p.studentId} className="hover:bg-gray-800/30">
-                      <td className="px-4 py-3 font-semibold text-white">{p.studentName}</td>
-                      <td className="px-3 py-3 font-mono text-gray-300">{p.studentRegistrationId}</td>
-                      <td className="px-3 py-3 text-gray-400">
+                      <td className="px-3 py-3 font-medium text-white">{p.studentName}</td>
+                      <td className="px-3 py-3 font-mono text-cyan-300">{p.studentRegistrationId}</td>
+                      <td className="px-3 py-3 font-mono text-gray-400">
                         {new Date(p.joinTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                       </td>
                       <td className="px-3 py-3 text-gray-400">
@@ -538,19 +855,41 @@ export default function ClassroomMonitoringPage() {
 // Student Screen Tile in the Monitoring Gallery
 function StudentScreenTile({
   participant,
+  remoteStream,
+  peerState,
   onFocus,
   onLowerHand
 }: {
   participant: LabParticipant;
+  remoteStream?: MediaStream;
+  peerState?: { connectionState: string; iceState: string; streamId?: string; trackCount: number };
   onFocus: () => void;
   onLowerHand: () => void;
 }) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+
+  // Bind WebRTC stream to video element: video.srcObject = remoteStream
+  useEffect(() => {
+    if (videoRef.current) {
+      if (remoteStream) {
+        videoRef.current.srcObject = remoteStream;
+        videoRef.current.play().catch(e => console.log('Autoplay handled:', e));
+      } else {
+        videoRef.current.srcObject = null;
+      }
+    }
+  }, [remoteStream]);
+
+  const hasLiveStream = !!remoteStream;
+
   return (
     <div
       onClick={onFocus}
       className={`group bg-[#161b22] border rounded-xl overflow-hidden shadow-lg transition-all duration-200 cursor-pointer flex flex-col hover:border-emerald-500/70 hover:shadow-emerald-950/20 ${
         participant.isHandRaised
           ? 'border-amber-500 shadow-amber-950/30'
+          : hasLiveStream
+          ? 'border-emerald-500/60'
           : participant.isScreenSharing
           ? 'border-gray-800'
           : 'border-gray-800/60 opacity-85'
@@ -586,10 +925,15 @@ function StudentScreenTile({
             </span>
           )}
 
-          {participant.isScreenSharing ? (
+          {hasLiveStream ? (
+            <span className="flex items-center space-x-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
+              <span>Live Feed</span>
+            </span>
+          ) : participant.isScreenSharing ? (
             <span className="flex items-center space-x-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-              <span>Live</span>
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+              <span>Active</span>
             </span>
           ) : (
             <span className="text-[10px] text-gray-500 font-medium">Paused</span>
@@ -597,13 +941,35 @@ function StudentScreenTile({
         </div>
       </div>
 
-      {/* Live Screen Preview Canvas */}
-      <div className="relative aspect-video bg-[#0a0d12] flex items-center justify-center overflow-hidden">
-        <MockScreenCanvas
-          type={participant.mockScreenType || 'desktop'}
-          studentName={participant.studentName}
-          studentId={participant.studentRegistrationId}
-        />
+      {/* Live Screen Video Element or Simulated Fallback */}
+      <div className="relative aspect-video bg-black flex items-center justify-center overflow-hidden">
+        {hasLiveStream ? (
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            muted
+            className="w-full h-full object-contain bg-black"
+          />
+        ) : (
+          <MockScreenCanvas
+            type={participant.mockScreenType || 'desktop'}
+            studentName={participant.studentName}
+            studentId={participant.studentRegistrationId}
+          />
+        )}
+
+        {/* WebRTC State Overlay Pill */}
+        {peerState && (
+          <div className="absolute top-2 left-2 bg-black/75 backdrop-blur-xs px-2 py-0.5 rounded text-[9px] font-mono text-gray-300 border border-gray-800 flex items-center space-x-1">
+            <span
+              className={`w-1.5 h-1.5 rounded-full ${
+                peerState.connectionState === 'connected' ? 'bg-emerald-400' : 'bg-amber-400'
+              }`}
+            />
+            <span>{peerState.connectionState}</span>
+          </div>
+        )}
 
         {/* Hover Focus Button Overlay */}
         <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
@@ -616,7 +982,9 @@ function StudentScreenTile({
 
       {/* Bottom Footer Info */}
       <div className="px-3.5 py-2 border-t border-gray-800/80 bg-[#12161f] text-[11px] text-gray-400 flex items-center justify-between">
-        <span className="truncate max-w-[180px]">{participant.lastActivity || 'Present at station'}</span>
+        <span className="truncate max-w-[180px]">
+          {hasLiveStream ? 'Streaming live screen' : participant.lastActivity || 'Present at station'}
+        </span>
         <span className="font-mono text-[10px] text-gray-500">
           {Math.round(participant.timeInLabSeconds / 60)}m in lab
         </span>
@@ -625,7 +993,7 @@ function StudentScreenTile({
   );
 }
 
-// Realistic Canvas Simulation for Multi-Screen Computer Lab Desktop Preview
+// Realistic Canvas Simulation Fallback for Multi-Screen Computer Lab
 function MockScreenCanvas({
   type,
   studentName,
@@ -638,8 +1006,11 @@ function MockScreenCanvas({
   isFullSize?: boolean;
 }) {
   return (
-    <div className={`w-full h-full bg-[#181d24] flex flex-col overflow-hidden text-[10px] select-none ${isFullSize ? 'max-w-6xl max-h-[750px] shadow-2xl rounded-lg' : ''}`}>
-      {/* Fake OS Window Title Bar */}
+    <div
+      className={`w-full h-full bg-[#181d24] flex flex-col overflow-hidden text-[10px] select-none ${
+        isFullSize ? 'max-w-6xl max-h-[750px] shadow-2xl rounded-lg' : ''
+      }`}
+    >
       <div className="bg-[#21262d] px-2.5 py-1 flex items-center justify-between border-b border-gray-700/80">
         <div className="flex items-center space-x-1.5">
           <span className="w-2 h-2 rounded-full bg-rose-500/80 inline-block" />
@@ -649,93 +1020,28 @@ function MockScreenCanvas({
             Station-{studentId} • {type.toUpperCase()}
           </span>
         </div>
-        <span className="text-[9px] text-gray-500">{studentName}</span>
+        <span className="text-[9px] text-gray-500 font-mono">1920x1080</span>
       </div>
 
-      {/* Screen Window Body */}
-      <div className="flex-1 p-3 font-mono text-[11px] text-gray-300 overflow-hidden flex flex-col justify-between bg-[#0e1217]">
-        {type === 'ide' && (
-          <div className="space-y-1">
-            <div className="text-gray-500">// Computer Lab Exercise • Task 3</div>
-            <div className="text-purple-400">#include &lt;iostream&gt;</div>
-            <div className="text-purple-400">#include &lt;vector&gt;</div>
-            <div className="text-blue-400">using namespace <span className="text-emerald-300">std;</span></div>
-            <div className="text-yellow-300">int <span className="text-blue-300">main()</span> &#123;</div>
-            <div className="pl-4 text-emerald-300">cout &lt;&lt; "Running simulation test..." &lt;&lt; endl;</div>
-            <div className="pl-4 text-gray-400">vector&lt;int&gt; buffer(1024, 0);</div>
-            <div className="pl-4 text-gray-300">return 0;</div>
-            <div className="text-yellow-300">&#125;</div>
-          </div>
-        )}
-
-        {type === 'terminal' && (
-          <div className="space-y-1 text-emerald-400">
-            <div className="text-gray-400">$ gcc -Wall main.c -o lab_exec</div>
-            <div>[Compiling station-{studentId} source files...]</div>
-            <div className="text-cyan-300">$ ./lab_exec --test-suite</div>
-            <div>[RUNNING] Unit test 1: Memory bounds ... OK</div>
-            <div>[RUNNING] Unit test 2: Socket loopback ... OK</div>
-            <div className="text-amber-300">[WARNING] Execution timeout: waiting on child process...</div>
-            <div className="flex items-center space-x-1">
-              <span>$ </span>
-              <span className="w-1.5 h-3 bg-emerald-400 animate-pulse inline-block" />
-            </div>
-          </div>
-        )}
-
-        {type === 'browser' && (
-          <div className="space-y-2">
-            <div className="bg-[#1c2128] p-1.5 rounded text-[10px] text-gray-400 flex items-center space-x-2">
-              <span className="text-emerald-400">https://</span>
-              <span>university-lab.internal/docs/spec-v4</span>
-            </div>
-            <div className="p-2 border border-gray-800 rounded bg-[#161b22] text-xs text-gray-300 space-y-1">
-              <div className="font-bold text-white">Laboratory Specification Document</div>
-              <div className="text-[10px] text-gray-400 leading-normal">
-                Follow steps 1-4 to connect the network node and verify heartbeat packets.
-              </div>
-            </div>
-          </div>
-        )}
-
-        {type === 'document' && (
-          <div className="space-y-1.5 text-gray-300">
-            <div className="text-xs font-bold text-cyan-400">CS101 Lab Report — {studentName}</div>
-            <div className="text-[10px] text-gray-400 leading-relaxed">
-              Objective: Analyze algorithm efficiency across different cache line alignments.
-              Data points logged: 24 trials completed with 0 segment faults.
-            </div>
-            <div className="h-10 bg-gray-900 border border-gray-800 rounded p-1 flex items-center justify-around">
-              <div className="w-3 bg-emerald-500 h-6 rounded-t" />
-              <div className="w-3 bg-emerald-500 h-8 rounded-t" />
-              <div className="w-3 bg-emerald-500 h-5 rounded-t" />
-              <div className="w-3 bg-cyan-500 h-7 rounded-t" />
-            </div>
-          </div>
-        )}
-
-        {type === 'desktop' && (
-          <div className="flex-1 flex flex-col justify-between">
-            <div className="flex space-x-4">
-              <div className="w-8 h-8 rounded bg-gray-800 border border-gray-700 flex items-center justify-center text-xs">
-                💻
-              </div>
-              <div className="w-8 h-8 rounded bg-gray-800 border border-gray-700 flex items-center justify-center text-xs">
-                📁
-              </div>
-            </div>
-            <div className="text-center text-[10px] text-gray-500">
-              Desktop Station • Active Session
-            </div>
-          </div>
-        )}
-
-        {/* Fake Desktop Taskbar */}
-        <div className="pt-2 border-t border-gray-800 flex items-center justify-between text-[9px] text-gray-500">
-          <span>Display: 1920x1080 (Primary Monitor)</span>
-          <span>WebRTC 60 FPS</span>
-        </div>
+      <div className="flex-1 bg-[#0d1117] p-3 flex flex-col items-center justify-center space-y-2 text-center">
+        <Video className="w-8 h-8 text-gray-700" />
+        <span className="text-gray-400 text-xs font-semibold">Station Desktop Idle</span>
+        <span className="text-[10px] text-gray-600">Waiting for student to initiate screen sharing</span>
       </div>
     </div>
+  );
+}
+
+export default function InstructorLiveSessionPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex-1 flex items-center justify-center min-h-[80vh] text-gray-400 text-xs">
+          Loading instructor live session...
+        </div>
+      }
+    >
+      <InstructorLiveSessionContent />
+    </Suspense>
   );
 }
