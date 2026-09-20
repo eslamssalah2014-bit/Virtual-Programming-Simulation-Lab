@@ -307,10 +307,16 @@ export const SEED_SESSIONS: LabSession[] = [
     courseId: 'course-1',
     name: 'CS101 Lab Session #4: Algorithms & Modular Python',
     sessionCode: 'PY-101',
+    groupCode: 'CS101-G1',
+    groupName: 'Computer Science Section A (Morning)',
+    sessionNumber: 4,
+    sessionTitle: 'Algorithms & Modular Python',
+    language: 'python',
     startTime: new Date(Date.now() - 45 * 60000).toISOString(),
     endTime: new Date(Date.now() + 75 * 60000).toISOString(),
     isActive: true,
-    createdAt: new Date(Date.now() - 2 * 86400000).toISOString()
+    createdAt: new Date(Date.now() - 2 * 86400000).toISOString(),
+    joinedCount: 5
   },
   {
     id: 'session-102',
@@ -318,10 +324,33 @@ export const SEED_SESSIONS: LabSession[] = [
     courseId: 'course-2',
     name: 'CS204 Lab Session #2: Modern JavaScript Architecture',
     sessionCode: 'JS-204',
+    groupCode: 'CS204-G3',
+    groupName: 'Web Systems Section B',
+    sessionNumber: 2,
+    sessionTitle: 'Modern JavaScript Architecture',
+    language: 'javascript',
     startTime: new Date(Date.now() - 120 * 60000).toISOString(),
     endTime: new Date(Date.now() - 10 * 60000).toISOString(),
     isActive: false,
-    createdAt: new Date(Date.now() - 5 * 86400000).toISOString()
+    createdAt: new Date(Date.now() - 5 * 86400000).toISOString(),
+    joinedCount: 18
+  },
+  {
+    id: 'session-103',
+    assignmentId: 'assign-3',
+    courseId: 'course-2',
+    name: 'CS204 Lab Session #1: Responsive Web UI',
+    sessionCode: 'WEB-101',
+    groupCode: 'CS204-G1',
+    groupName: 'Web Systems Section A',
+    sessionNumber: 1,
+    sessionTitle: 'Responsive Web UI with HTML/CSS',
+    language: 'html',
+    startTime: new Date(Date.now() - 48 * 3600000).toISOString(),
+    endTime: new Date(Date.now() - 46 * 3600000).toISOString(),
+    isActive: false,
+    createdAt: new Date(Date.now() - 7 * 86400000).toISOString(),
+    joinedCount: 22
   }
 ];
 
@@ -330,12 +359,15 @@ export const INITIAL_STUDENTS_STATE: Record<string, LiveStudentState> = {
   'stud-1': {
     studentId: 'stud-1',
     studentName: 'Alex Chen',
+    studentRegistrationId: '2024-0101',
     studentEmail: 'alex.chen@university.edu',
     avatarUrl: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=120&h=120&fit=crop&crop=face',
     status: 'Active',
     currentFileId: 'file-1',
+    currentFileName: 'main.py',
     files: JSON.parse(JSON.stringify(SEED_ASSIGNMENTS[0].starterFiles)),
     terminalOutput: '=== CS101 Lab 4 Execution ===\n\n1. Prime Number Tests:\n  - is_prime(2) -> True\n  - is_prime(3) -> True\n  - is_prime(4) -> False\n  - is_prime(11) -> True\n  - is_prime(15) -> False\n  - is_prime(19) -> True\n  - is_prime(24) -> False\n  - is_prime(29) -> True\n\n2. Fibonacci Sequence (first 10 numbers):\n  Result: [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]\n[Process completed successfully in 0.082s]',
+    runCount: 7,
     lastExecution: {
       timestamp: new Date(Date.now() - 4 * 60000).toISOString(),
       status: 'success',
@@ -361,10 +393,12 @@ export const INITIAL_STUDENTS_STATE: Record<string, LiveStudentState> = {
   'stud-2': {
     studentId: 'stud-2',
     studentName: 'Maya Patel',
+    studentRegistrationId: '2024-0102',
     studentEmail: 'maya.patel@university.edu',
     avatarUrl: 'https://images.unsplash.com/photo-1580489944761-15a19d654956?w=120&h=120&fit=crop&crop=face',
     status: 'Active',
     currentFileId: 'file-2',
+    currentFileName: 'utils.py',
     files: [
       {
         id: 'file-1',
@@ -394,6 +428,7 @@ def get_fibonacci(count: int) -> list:
       }
     ],
     terminalOutput: 'Traceback (most recent call last):\n  File "main.py", line 18, in <module>\n    fib_list = get_fibonacci(10)\nTypeError: \'NoneType\' object is not iterable',
+    runCount: 4,
     lastExecution: {
       timestamp: new Date(Date.now() - 3 * 60000).toISOString(),
       status: 'error',
@@ -427,12 +462,15 @@ def get_fibonacci(count: int) -> list:
   'stud-3': {
     studentId: 'stud-3',
     studentName: 'Liam Davis',
+    studentRegistrationId: '2024-0103',
     studentEmail: 'liam.davis@university.edu',
     avatarUrl: 'https://images.unsplash.com/photo-1570295999919-56ceb5ecca61?w=120&h=120&fit=crop&crop=face',
     status: 'Idle',
     currentFileId: 'file-1',
+    currentFileName: 'main.py',
     files: JSON.parse(JSON.stringify(SEED_ASSIGNMENTS[0].starterFiles)),
     terminalOutput: '=== CS101 Lab 4 Execution ===\nWaiting for user input...',
+    runCount: 2,
     lastExecution: {
       timestamp: new Date(Date.now() - 15 * 60000).toISOString(),
       status: 'success',
@@ -450,12 +488,15 @@ def get_fibonacci(count: int) -> list:
   'stud-4': {
     studentId: 'stud-4',
     studentName: 'Sofia Rodriguez',
+    studentRegistrationId: '2024-0104',
     studentEmail: 'sofia.rodriguez@university.edu',
     avatarUrl: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=120&h=120&fit=crop&crop=face',
     status: 'Submitted',
     currentFileId: 'file-1',
+    currentFileName: 'main.py',
     files: JSON.parse(JSON.stringify(SEED_ASSIGNMENTS[0].starterFiles)),
     terminalOutput: '=== CS101 Lab 4 Execution ===\nAll 4 tasks completed!\nFinal score: 100/100\n[Submission recorded]',
+    runCount: 11,
     lastExecution: {
       timestamp: new Date(Date.now() - 8 * 60000).toISOString(),
       status: 'success',
@@ -481,15 +522,18 @@ def get_fibonacci(count: int) -> list:
   'stud-5': {
     studentId: 'stud-5',
     studentName: 'Marcus Taylor',
+    studentRegistrationId: '2024-0105',
     studentEmail: 'marcus.taylor@university.edu',
     avatarUrl: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=120&h=120&fit=crop&crop=face',
     status: 'Disconnected',
     currentFileId: 'file-1',
+    currentFileName: 'main.py',
     files: JSON.parse(JSON.stringify(SEED_ASSIGNMENTS[0].starterFiles)),
     terminalOutput: '',
+    runCount: 1,
     lastActivity: 'Disconnected 18 minutes ago',
     lastActivityTime: new Date(Date.now() - 18 * 60000).toISOString(),
-    progressPercentage: 10,
+    progressPercentage: 15,
     completedTaskIds: [],
     helpRequest: null,
     instructorNote: {
@@ -501,8 +545,8 @@ def get_fibonacci(count: int) -> list:
       content: 'Network dropout or left early. Need to follow up.',
       updatedAt: new Date(Date.now() - 15 * 60000).toISOString()
     },
-    joinTime: new Date(Date.now() - 30 * 60000).toISOString(),
-    timeInLabSeconds: 720
+    joinTime: new Date(Date.now() - 44 * 60000).toISOString(),
+    timeInLabSeconds: 1560
   }
 };
 

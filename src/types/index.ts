@@ -48,15 +48,22 @@ export interface Assignment {
 
 export interface LabSession {
   id: string;
-  assignmentId: string;
-  courseId: string;
+  assignmentId?: string;
+  courseId?: string;
   name: string;
   sessionCode: string;
+  groupCode: string;
+  groupName: string;
+  sessionNumber: string | number;
+  sessionTitle: string;
+  language: string;
   startTime: string;
-  endTime: string;
+  endTime?: string;
   isActive: boolean;
   createdAt: string;
+  joinedCount?: number;
 }
+
 
 export type StudentStatus = 'Active' | 'Idle' | 'Disconnected' | 'Submitted';
 
@@ -117,12 +124,15 @@ export interface ExecutionResult {
 export interface LiveStudentState {
   studentId: string;
   studentName: string;
-  studentEmail: string;
+  studentRegistrationId?: string;
+  studentEmail?: string;
   avatarUrl?: string;
   status: StudentStatus;
   currentFileId: string;
+  currentFileName?: string;
   files: CodeFile[];
   terminalOutput: string;
+  runCount?: number;
   lastExecution?: {
     timestamp: string;
     status: 'success' | 'error';

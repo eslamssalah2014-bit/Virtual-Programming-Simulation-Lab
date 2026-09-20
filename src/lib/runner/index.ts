@@ -34,10 +34,10 @@ const pyodideRunner = new PyodideRunner();
 const jsRunner = new JavaScriptRunner();
 
 export async function runCode(
-  language: SupportedLanguage,
+  language: string,
   code: string,
   files: CodeFile[],
-  activeFileName: string
+  activeFileName: string = 'main.py'
 ): Promise<ExecutionResult> {
   if (language === 'python') {
     return pyodideRunner.execute(code, files, activeFileName);

@@ -1,199 +1,498 @@
 'use client';
 
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import Link from 'next/link';
-import { useAuth } from '@/lib/context/AuthContext';
+import { useSearchParams } from 'next/navigation';
 import {
-  Code2,
+  Plus,
   Tv,
-  FileCode,
-  BarChart3,
-  ShieldCheck,
-  Zap,
-  Play,
-  CheckCircle2,
-  ArrowRight,
-  Terminal,
-  Activity,
+  Copy,
+  Check,
+  Code2,
+  Calendar,
   Users,
   Clock,
+  ArrowRight,
+  ExternalLink,
+  Layers,
+  Search,
+  CheckCircle2,
+  X,
   Sparkles
 } from 'lucide-react';
+import { LabSession } from '@/types';
 
-export default function HomePage() {
-  const { currentUser, switchUser, isSimulationActive, toggleSimulation } = useAuth();
+function InstructorDashboardContent() {
+  const searchParams = useSearchParams();
+  const [sessions, setSessions] = useState<LabSession[]>([]);
+  const [activeTab, setActiveTab] = useState<'active' | 'past'>('active');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+
+  // Modal State
+  const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
+  const [createdSession, setCreatedSession] = useState<LabSession | null>(null);
+  const [formData, setFormData] = useState({
+    groupCode: '',
+    groupName: '',
+    sessionNumber: '1',
+    sessionTitle: '',
+    language: 'python'
+  });
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Load Sessions
+  const loadSessions = () => {
+    fetch('/api/sessions')
+      .then(r => r.json())
+      .then(data => {
+        if (Array.isArray(data)) setSessions(data);
+      })
+      .catch(err => console.error('Failed to load sessions:', err));
+  };
+
+  useEffect(() => {
+    loadSessions();
+
+    // Check if query param or custom event asks to open modal
+    if (searchParams.get('action') === 'create') {
+      setIsCreateModalOpen(true);
+    }
+
+    const handleOpenEvent = () => setIsCreateModalOpen(true);
+    window.addEventListener('open-create-session', handleOpenEvent);
+    return () => window.removeEventListener('open-create-session', handleOpenEvent);
+  }, [searchParams]);
+
+  // Filter sessions
+  const filteredSessions = sessions.filter(session => {
+    const matchesTab = activeTab === 'active' ? session.isActive : !session.isActive;
+    const matchesSearch =
+      (session.groupCode || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (session.groupName || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (session.sessionTitle || session.name || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (session.language || '').toLowerCase().includes(searchQuery.toLowerCase());
+    return matchesTab && matchesSearch;
+  });
+
+  const getJoinUrl = (session: LabSession) => {
+    if (typeof window === 'undefined') return `/join/${session.sessionCode || session.id}`;
+    return `${window.location.origin}/join/${session.sessionCode || session.id}`;
+  };
+
+  const handleCopyLink = (session: LabSession) => {
+    const url = getJoinUrl(session);
+    navigator.clipboard.writeText(url);
+    setCopiedId(session.id);
+    setTimeout(() => setCopiedId(null), 2000);
+  };
+
+  const handleCreateSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!formData.groupCode || !formData.sessionTitle) return;
+
+    setIsSubmitting(true);
+    try {
+      const res = await fetch('/api/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(formData)
+      });
+      const newSession = await res.json();
+      setCreatedSession(newSession);
+      loadSessions();
+    } catch (err) {
+      console.error('Failed to create session:', err);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleCloseModal = () => {
+    setIsCreateModalOpen(false);
+    setCreatedSession(null);
+    setFormData({
+      groupCode: '',
+      groupName: '',
+      sessionNumber: '1',
+      sessionTitle: '',
+      language: 'python'
+    });
+  };
 
   return (
-    <div className="flex-1 bg-[#0d1117] text-white">
-      {/* Hero Section */}
-      <section className="relative overflow-hidden border-b border-gray-800 py-16 px-6">
-        <div className="max-w-5xl mx-auto text-center space-y-6">
-          <div className="inline-flex items-center space-x-2 px-3.5 py-1.5 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs font-semibold">
-            <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
-            <span>Virtual Programming Simulation Lab • Phase 1 Active</span>
+    <div className="min-h-[calc(100vh-3.5rem)] bg-[#0d1117] text-gray-100 p-6">
+      <div className="max-w-7xl mx-auto space-y-6">
+        {/* Header & Primary Action Bar */}
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 pb-4 border-b border-gray-800">
+          <div>
+            <h1 className="text-2xl font-bold text-white tracking-tight">Instructor Sessions Dashboard</h1>
+            <p className="text-xs text-gray-400 mt-1">
+              Create and manage interactive programming labs, distribute student session links, and monitor live coding.
+            </p>
           </div>
 
-          <h1 className="text-4xl sm:text-5xl font-extrabold tracking-tight text-white leading-tight max-w-4xl mx-auto">
-            Simulate Real Classroom Labs with{' '}
-            <span className="bg-gradient-to-r from-emerald-400 via-teal-300 to-cyan-400 bg-clip-text text-transparent">
-              Live Keystroke Monitoring
-            </span>
-          </h1>
-
-          <p className="text-gray-400 text-sm sm:text-base max-w-2xl mx-auto leading-relaxed">
-            Students code directly in the browser via Monaco Editor and WebAssembly runtimes. Instructors inspect workspaces, track timelines, and answer help requests in real time without page reloads.
-          </p>
-
-          {/* Quick Action Buttons */}
-          <div className="flex flex-wrap items-center justify-center gap-3 pt-4">
+          <div className="flex items-center space-x-3">
             <Link
               href="/instructor/sessions/session-101"
-              className="px-6 py-3 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 font-bold text-sm text-white shadow-lg shadow-cyan-900/30 flex items-center space-x-2 transition"
+              className="bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-200 px-3.5 py-2 rounded-lg text-xs font-medium flex items-center space-x-1.5 transition"
             >
-              <Tv className="w-4 h-4" />
-              <span>Open Instructor Live Monitor</span>
-              <ArrowRight className="w-4 h-4" />
-            </Link>
-
-            <Link
-              href="/lab/session-101"
-              className="px-6 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 font-bold text-sm text-white shadow-lg shadow-emerald-900/30 flex items-center space-x-2 transition"
-            >
-              <Code2 className="w-4 h-4" />
-              <span>Enter Student Coding Lab</span>
+              <Tv className="w-4 h-4 text-emerald-400" />
+              <span>Student Monitoring</span>
             </Link>
 
             <button
-              onClick={toggleSimulation}
-              className={`px-5 py-3 rounded-xl border text-sm font-semibold flex items-center space-x-2 transition ${
-                isSimulationActive
-                  ? 'bg-amber-500/20 text-amber-300 border-amber-500/50 animate-pulse'
-                  : 'bg-gray-800/80 hover:bg-gray-800 text-gray-300 border-gray-700'
-              }`}
+              onClick={() => setIsCreateModalOpen(true)}
+              className="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded-lg text-xs font-semibold flex items-center space-x-1.5 shadow-sm transition"
             >
-              <Play className="w-4 h-4 fill-current" />
-              <span>{isSimulationActive ? 'Stop Live Student Sim' : 'Launch Demo Sim Activity'}</span>
+              <Plus className="w-4 h-4" />
+              <span>Create Session</span>
             </button>
           </div>
         </div>
-      </section>
 
-      {/* Role Navigation Cards */}
-      <section className="max-w-6xl mx-auto px-6 py-12 space-y-8">
-        <div className="text-center space-y-1">
-          <h2 className="text-xl font-bold text-white">System Portals & Experiences</h2>
-          <p className="text-xs text-gray-400">
-            Explore both sides of the classroom or manage curriculum as an administrator:
-          </p>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          {/* Card 1: Student Workspace */}
-          <div className="bg-[#161b22] border border-gray-800 rounded-2xl p-6 flex flex-col justify-between space-y-5 hover:border-emerald-500/40 transition group">
-            <div className="space-y-3">
-              <div className="w-12 h-12 rounded-xl bg-emerald-500/10 text-emerald-400 flex items-center justify-center border border-emerald-500/20 group-hover:scale-105 transition">
-                <Code2 className="w-6 h-6" />
-              </div>
-              <h3 className="text-lg font-bold text-white">Student Lab Workspace</h3>
-              <p className="text-xs text-gray-400 leading-relaxed">
-                Full in-browser coding environment equipped with Monaco Editor, Pyodide Python WASM runner, multi-file explorer, activity logging, and the "Need Help" emergency queue.
-              </p>
-              <ul className="text-xs text-gray-300 space-y-1.5 pt-2">
-                <li className="flex items-center space-x-1.5">
-                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>Python, JavaScript & HTML/CSS support</span>
-                </li>
-                <li className="flex items-center space-x-1.5">
-                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>Auto-save & live WebSocket broadcast</span>
-                </li>
-                <li className="flex items-center space-x-1.5">
-                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>Live Terminal & task completion checklist</span>
-                </li>
-              </ul>
-            </div>
-
-            <Link
-              href="/lab/session-101"
-              className="w-full py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 font-semibold text-xs text-white text-center transition flex items-center justify-center space-x-2 shadow-sm"
+        {/* Operational Tabs & Search */}
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          {/* Main Tabs */}
+          <div className="flex items-center space-x-1 bg-[#161b22] p-1 rounded-lg border border-gray-800 inline-flex">
+            <button
+              onClick={() => setActiveTab('active')}
+              className={`px-4 py-1.5 rounded-md text-xs font-medium transition flex items-center space-x-2 ${
+                activeTab === 'active'
+                  ? 'bg-emerald-600 text-white font-semibold shadow-xs'
+                  : 'text-gray-400 hover:text-white'
+              }`}
             >
-              <span>Launch Student Lab (Alex Chen)</span>
-              <ArrowRight className="w-3.5 h-3.5" />
-            </Link>
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+              <span>My Active Sessions</span>
+              <span className="ml-1 px-1.5 py-0.2 rounded-full bg-black/30 text-[10px]">
+                {sessions.filter(s => s.isActive).length}
+              </span>
+            </button>
+
+            <button
+              onClick={() => setActiveTab('past')}
+              className={`px-4 py-1.5 rounded-md text-xs font-medium transition flex items-center space-x-2 ${
+                activeTab === 'past'
+                  ? 'bg-gray-700 text-white font-semibold'
+                  : 'text-gray-400 hover:text-white'
+              }`}
+            >
+              <Clock className="w-3.5 h-3.5" />
+              <span>Past Sessions</span>
+              <span className="ml-1 px-1.5 py-0.2 rounded-full bg-black/30 text-[10px]">
+                {sessions.filter(s => !s.isActive).length}
+              </span>
+            </button>
           </div>
 
-          {/* Card 2: Instructor Live Monitoring */}
-          <div className="bg-[#161b22] border border-gray-800 rounded-2xl p-6 flex flex-col justify-between space-y-5 hover:border-cyan-500/40 transition group">
-            <div className="space-y-3">
-              <div className="w-12 h-12 rounded-xl bg-cyan-500/10 text-cyan-400 flex items-center justify-center border border-cyan-500/20 group-hover:scale-105 transition">
-                <Tv className="w-6 h-6" />
-              </div>
-              <h3 className="text-lg font-bold text-white">Instructor Live Monitor</h3>
-              <p className="text-xs text-gray-400 leading-relaxed">
-                Supervise active students with zero-latency keystroke updates, live terminal error inspection, activity timelines, help queue priority alerts, and evaluation tagging.
-              </p>
-              <ul className="text-xs text-gray-300 space-y-1.5 pt-2">
-                <li className="flex items-center space-x-1.5">
-                  <CheckCircle2 className="w-3.5 h-3.5 text-cyan-400" />
-                  <span>Live Student Grid (Active, Idle, Disconnected)</span>
-                </li>
-                <li className="flex items-center space-x-1.5">
-                  <CheckCircle2 className="w-3.5 h-3.5 text-cyan-400" />
-                  <span>Focus Student Panel (Mirrored Monaco Editor)</span>
-                </li>
-                <li className="flex items-center space-x-1.5">
-                  <CheckCircle2 className="w-3.5 h-3.5 text-cyan-400" />
-                  <span>Instructor Notes & CSV Attendance Export</span>
-                </li>
-              </ul>
-            </div>
-
-            <Link
-              href="/instructor/sessions/session-101"
-              className="w-full py-2.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 font-semibold text-xs text-white text-center transition flex items-center justify-center space-x-2 shadow-sm"
-            >
-              <span>Open Monitor (Dr. Jenkins)</span>
-              <ArrowRight className="w-3.5 h-3.5" />
-            </Link>
-          </div>
-
-          {/* Card 3: Admin & Analytics */}
-          <div className="bg-[#161b22] border border-gray-800 rounded-2xl p-6 flex flex-col justify-between space-y-5 hover:border-purple-500/40 transition group">
-            <div className="space-y-3">
-              <div className="w-12 h-12 rounded-xl bg-purple-500/10 text-purple-400 flex items-center justify-center border border-purple-500/20 group-hover:scale-105 transition">
-                <BarChart3 className="w-6 h-6" />
-              </div>
-              <h3 className="text-lg font-bold text-white">Analytics & Administration</h3>
-              <p className="text-xs text-gray-400 leading-relaxed">
-                Review attendance duration curves, assignment submission percentages, student engagement scores, and manage course curriculum and user roles.
-              </p>
-              <ul className="text-xs text-gray-300 space-y-1.5 pt-2">
-                <li className="flex items-center space-x-1.5">
-                  <CheckCircle2 className="w-3.5 h-3.5 text-purple-400" />
-                  <span>Real-time duration & attendance calculation</span>
-                </li>
-                <li className="flex items-center space-x-1.5">
-                  <CheckCircle2 className="w-3.5 h-3.5 text-purple-400" />
-                  <span>Reusable assignment & template creator</span>
-                </li>
-                <li className="flex items-center space-x-1.5">
-                  <CheckCircle2 className="w-3.5 h-3.5 text-purple-400" />
-                  <span>Extensible Phase 2 Docker architecture</span>
-                </li>
-              </ul>
-            </div>
-
-            <Link
-              href="/instructor/analytics"
-              className="w-full py-2.5 rounded-lg bg-purple-600 hover:bg-purple-500 font-semibold text-xs text-white text-center transition flex items-center justify-center space-x-2 shadow-sm"
-            >
-              <span>View Analytics & Reports</span>
-              <ArrowRight className="w-3.5 h-3.5" />
-            </Link>
+          {/* Search Box */}
+          <div className="relative w-full sm:w-72">
+            <Search className="w-4 h-4 text-gray-500 absolute left-3 top-2.5" />
+            <input
+              type="text"
+              placeholder="Search group code, title, or language..."
+              value={searchQuery}
+              onChange={e => setSearchQuery(e.target.value)}
+              className="w-full bg-[#161b22] border border-gray-800 rounded-lg pl-9 pr-3 py-1.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-gray-600"
+            />
           </div>
         </div>
-      </section>
+
+        {/* Sessions Grid / Table */}
+        {filteredSessions.length === 0 ? (
+          <div className="p-12 text-center bg-[#161b22] border border-gray-800/80 rounded-xl space-y-3">
+            <Layers className="w-8 h-8 text-gray-600 mx-auto" />
+            <div className="text-sm font-medium text-gray-300">
+              No {activeTab === 'active' ? 'active' : 'past'} sessions found.
+            </div>
+            <p className="text-xs text-gray-500 max-w-sm mx-auto">
+              {activeTab === 'active'
+                ? 'Click "+ Create Session" above to launch a new programming session with a shareable student link.'
+                : 'Completed lab sessions will appear here for historical review.'}
+            </p>
+            {activeTab === 'active' && (
+              <button
+                onClick={() => setIsCreateModalOpen(true)}
+                className="mt-2 bg-emerald-600 hover:bg-emerald-500 text-white px-3.5 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center space-x-1.5 transition"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Create New Session</span>
+              </button>
+            )}
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {filteredSessions.map(session => (
+              <div
+                key={session.id}
+                className="bg-[#161b22] border border-gray-800 hover:border-gray-700 rounded-xl p-5 flex flex-col justify-between transition space-y-4 shadow-sm"
+              >
+                <div>
+                  {/* Top Bar with Group Code & Status */}
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="bg-gray-800 text-gray-200 border border-gray-700 font-mono text-[11px] font-bold px-2 py-0.5 rounded">
+                      {session.groupCode || 'GRP-1'}
+                    </span>
+                    <div className="flex items-center space-x-2">
+                      <span className="capitalize text-[11px] font-medium px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                        {session.language || 'python'}
+                      </span>
+                      {session.isActive ? (
+                        <span className="inline-flex items-center text-[10px] text-emerald-400 font-semibold">
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse mr-1"></span>
+                          Live
+                        </span>
+                      ) : (
+                        <span className="text-[10px] text-gray-500 font-medium">Finished</span>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Title & Group Name */}
+                  <h3 className="text-base font-bold text-white leading-snug">
+                    {session.sessionNumber ? `Session #${session.sessionNumber}: ` : ''}
+                    {session.sessionTitle || session.name}
+                  </h3>
+                  <div className="text-xs text-gray-400 mt-1">{session.groupName || 'Computer Science Lab Group'}</div>
+                </div>
+
+                {/* Session Details / Stats */}
+                <div className="pt-3 border-t border-gray-800/80 text-xs text-gray-400 flex items-center justify-between">
+                  <div className="flex items-center space-x-1.5">
+                    <Users className="w-3.5 h-3.5 text-gray-400" />
+                    <span>
+                      <strong className="text-gray-200 font-semibold">{session.joinedCount || 0}</strong> students joined
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-gray-500 font-mono">
+                    Code: {session.sessionCode || session.id}
+                  </div>
+                </div>
+
+                {/* Action Buttons */}
+                <div className="pt-2 flex items-center space-x-2">
+                  <Link
+                    href={`/instructor/sessions/${session.id}`}
+                    className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white py-1.5 px-3 rounded-lg text-xs font-semibold flex items-center justify-center space-x-1.5 transition text-center shadow-xs"
+                  >
+                    <Tv className="w-3.5 h-3.5" />
+                    <span>Open Live Monitor</span>
+                  </Link>
+
+                  <button
+                    onClick={() => handleCopyLink(session)}
+                    title="Copy Student Join Link"
+                    className="bg-[#0d1117] hover:bg-gray-800 border border-gray-700 text-gray-300 py-1.5 px-2.5 rounded-lg text-xs flex items-center space-x-1 transition"
+                  >
+                    {copiedId === session.id ? (
+                      <>
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                        <span className="text-[11px] text-emerald-400 font-medium">Copied</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3.5 h-3.5 text-gray-400" />
+                        <span className="text-[11px]">Copy Link</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* CREATE SESSION MODAL */}
+        {isCreateModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-xs p-4">
+            <div className="bg-[#161b22] border border-gray-700 rounded-xl w-full max-w-lg shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+              {/* Header */}
+              <div className="px-6 py-4 border-b border-gray-800 flex items-center justify-between bg-gray-900/30">
+                <div className="flex items-center space-x-2">
+                  <div className="w-7 h-7 rounded-lg bg-emerald-600/20 text-emerald-400 flex items-center justify-center">
+                    <Plus className="w-4 h-4" />
+                  </div>
+                  <h2 className="font-bold text-white text-base">
+                    {createdSession ? 'Session Created Successfully!' : 'Create New Programming Session'}
+                  </h2>
+                </div>
+                <button onClick={handleCloseModal} className="text-gray-400 hover:text-white transition">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {/* Created Session Success View */}
+              {createdSession ? (
+                <div className="p-6 space-y-5">
+                  <div className="p-4 bg-emerald-500/10 border border-emerald-500/30 rounded-xl space-y-2">
+                    <div className="flex items-center space-x-2 text-emerald-400 font-bold text-sm">
+                      <CheckCircle2 className="w-4 h-4" />
+                      <span>Lab Session Ready for Students</span>
+                    </div>
+                    <div className="text-xs text-gray-300">
+                      <strong>{createdSession.sessionTitle}</strong> ({createdSession.groupCode}) • Language:{' '}
+                      <span className="capitalize font-mono text-emerald-300">{createdSession.language}</span>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-gray-300 mb-1.5">
+                      Unique Student Join Link:
+                    </label>
+                    <div className="flex items-center space-x-2">
+                      <input
+                        type="text"
+                        readOnly
+                        value={getJoinUrl(createdSession)}
+                        className="flex-1 bg-[#0d1117] border border-gray-700 rounded-lg px-3 py-2 text-xs text-gray-200 font-mono focus:outline-none select-all"
+                      />
+                      <button
+                        onClick={() => handleCopyLink(createdSession)}
+                        className="bg-emerald-600 hover:bg-emerald-500 text-white px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition"
+                      >
+                        {copiedId === createdSession.id ? (
+                          <>
+                            <Check className="w-4 h-4" />
+                            <span>Copied!</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-4 h-4" />
+                            <span>Copy Link</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                    <p className="text-[11px] text-gray-400 mt-1.5">
+                      Send this link to your students. They will enter their Name & ID and start coding directly.
+                    </p>
+                  </div>
+
+                  <div className="pt-2 flex items-center justify-end space-x-3">
+                    <button
+                      onClick={handleCloseModal}
+                      className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg text-xs font-medium transition"
+                    >
+                      Done
+                    </button>
+                    <Link
+                      href={`/instructor/sessions/${createdSession.id}`}
+                      className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition shadow-sm"
+                    >
+                      <Tv className="w-3.5 h-3.5" />
+                      <span>Open Live Monitor</span>
+                    </Link>
+                  </div>
+                </div>
+              ) : (
+                /* Form Inputs View */
+                <form onSubmit={handleCreateSubmit} className="p-6 space-y-4">
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-xs font-semibold text-gray-300 mb-1">
+                        Group Code <span className="text-rose-400">*</span>
+                      </label>
+                      <input
+                        type="text"
+                        required
+                        placeholder="e.g. CS101-G2"
+                        value={formData.groupCode}
+                        onChange={e => setFormData({ ...formData, groupCode: e.target.value })}
+                        className="w-full bg-[#0d1117] border border-gray-700 rounded-lg px-3 py-2 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-emerald-500 font-mono"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-semibold text-gray-300 mb-1">
+                        Session Number <span className="text-rose-400">*</span>
+                      </label>
+                      <input
+                        type="text"
+                        required
+                        placeholder="e.g. 4"
+                        value={formData.sessionNumber}
+                        onChange={e => setFormData({ ...formData, sessionNumber: e.target.value })}
+                        className="w-full bg-[#0d1117] border border-gray-700 rounded-lg px-3 py-2 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-emerald-500"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-gray-300 mb-1">
+                      Group Name <span className="text-gray-500 font-normal">(Optional)</span>
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Computer Science Morning Section"
+                      value={formData.groupName}
+                      onChange={e => setFormData({ ...formData, groupName: e.target.value })}
+                      className="w-full bg-[#0d1117] border border-gray-700 rounded-lg px-3 py-2 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-emerald-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-gray-300 mb-1">
+                      Session Title <span className="text-rose-400">*</span>
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      placeholder="e.g. Binary Search Trees & Traversal"
+                      value={formData.sessionTitle}
+                      onChange={e => setFormData({ ...formData, sessionTitle: e.target.value })}
+                      className="w-full bg-[#0d1117] border border-gray-700 rounded-lg px-3 py-2 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-emerald-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-gray-300 mb-1">
+                      Programming Language <span className="text-rose-400">*</span>
+                    </label>
+                    <select
+                      value={formData.language}
+                      onChange={e => setFormData({ ...formData, language: e.target.value })}
+                      className="w-full bg-[#0d1117] border border-gray-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-emerald-500 capitalize"
+                    >
+                      <option value="python">Python 3 (Pyodide WebAssembly)</option>
+                      <option value="javascript">JavaScript (ES6+ Engine)</option>
+                      <option value="cpp">C++ (GCC Virtual Container)</option>
+                      <option value="java">Java (OpenJDK Runtime)</option>
+                      <option value="html">HTML5 / CSS3 Web Preview</option>
+                    </select>
+                  </div>
+
+                  <div className="pt-3 border-t border-gray-800 flex items-center justify-end space-x-3">
+                    <button
+                      type="button"
+                      onClick={handleCloseModal}
+                      className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg text-xs font-medium transition"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={isSubmitting || !formData.groupCode || !formData.sessionTitle}
+                      className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition shadow-sm"
+                    >
+                      <span>Create & Generate Link</span>
+                      <ArrowRight className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </form>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
     </div>
+  );
+}
+
+export default function InstructorDashboardPage() {
+  return (
+    <React.Suspense fallback={<div className="min-h-[calc(100vh-3.5rem)] bg-[#0d1117] p-6 text-xs text-gray-400">Loading Sessions Dashboard...</div>}>
+      <InstructorDashboardContent />
+    </React.Suspense>
   );
 }

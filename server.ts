@@ -70,8 +70,8 @@ async function bootstrap() {
     if (!session) {
       return res.status(404).json({ error: 'Session not found' });
     }
-    const assignment = dbStore.getAssignment(session.assignmentId);
-    const course = dbStore.getCourses().find(c => c.id === session.courseId);
+    const assignment = session.assignmentId ? dbStore.getAssignment(session.assignmentId) : undefined;
+    const course = session.courseId ? dbStore.getCourses().find(c => c.id === session.courseId) : undefined;
     res.json({ session, assignment, course });
   });
 

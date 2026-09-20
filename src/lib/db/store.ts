@@ -77,12 +77,148 @@ class LabDataStore {
     return this.sessions.find(s => s.id === id);
   }
 
-  createSession(session: LabSession): LabSession {
-    this.sessions.unshift(session);
-    if (!this.studentStates[session.id]) {
-      this.studentStates[session.id] = {};
+  createSession(sessionData: Partial<LabSession>): LabSession {
+    const id = sessionData.id || `session-${Date.now()}`;
+    const groupCode = sessionData.groupCode || 'GRP-1';
+    const sessionNumber = sessionData.sessionNumber || '1';
+    const sessionTitle = sessionData.sessionTitle || 'Interactive Programming Lab';
+    const language = sessionData.language || 'python';
+    const sessionCode = sessionData.sessionCode || `${groupCode.replace(/[^a-zA-Z0-9]/g, '')}-S${sessionNumber}`;
+
+    const newSession: LabSession = {
+      id,
+      assignmentId: sessionData.assignmentId || 'assign-1',
+      courseId: sessionData.courseId || 'course-1',
+      name: `${groupCode} Session #${sessionNumber}: ${sessionTitle}`,
+      sessionCode,
+      groupCode,
+      groupName: sessionData.groupName || 'General Group',
+      sessionNumber,
+      sessionTitle,
+      language,
+      startTime: sessionData.startTime || new Date().toISOString(),
+      endTime: sessionData.endTime,
+      isActive: sessionData.isActive !== undefined ? sessionData.isActive : true,
+      createdAt: new Date().toISOString(),
+      joinedCount: 0
+    };
+
+    this.sessions.unshift(newSession);
+    if (!this.studentStates[id]) {
+      this.studentStates[id] = {};
     }
-    return session;
+    return newSession;
+  }
+
+  // Register or retrieve student by Name & Student ID
+  registerStudent(
+    sessionId: string,
+    studentName: string,
+    studentRegistrationId: string
+  ): LiveStudentState {
+    if (!this.studentStates[sessionId]) {
+      this.studentStates[sessionId] = {};
+    }
+
+    const existing = Object.values(this.studentStates[sessionId]).find(
+      s => s.studentRegistrationId === studentRegistrationId
+    );
+    if (existing) {
+      existing.status = 'Active';
+      existing.lastActivity = 'Rejoined lab session';
+      existing.lastActivityTime = new Date().toISOString();
+      return existing;
+    }
+
+    const session = this.getSession(sessionId);
+    const lang = (session?.language || 'python').toLowerCase();
+
+    let defaultFiles: CodeFile[] = [];
+    if (lang === 'python') {
+      defaultFiles = [
+        {
+          id: 'file-main',
+          name: 'main.py',
+          language: 'python',
+          content: `# ${session?.sessionTitle || 'Lab Session'}\n# Student: ${studentName} (${studentRegistrationId})\n\ndef main():\n    print("Welcome to ${session?.groupName || 'Lab'}!")\n\nif __name__ == "__main__":\n    main()\n`
+        }
+      ];
+    } else if (lang === 'javascript') {
+      defaultFiles = [
+        {
+          id: 'file-main',
+          name: 'index.js',
+          language: 'javascript',
+          content: `// ${session?.sessionTitle || 'Lab Session'}\n// Student: ${studentName} (${studentRegistrationId})\n\nfunction startLab() {\n  console.log("Welcome to ${session?.groupName || 'Lab'}!");\n}\n\nstartLab();\n`
+        }
+      ];
+    } else if (lang === 'cpp') {
+      defaultFiles = [
+        {
+          id: 'file-main',
+          name: 'main.cpp',
+          language: 'python' as any,
+          content: `// ${session?.sessionTitle || 'Lab Session'}\n// Student: ${studentName} (${studentRegistrationId})\n#include <iostream>\nusing namespace std;\n\nint main() {\n    cout << "Welcome to ${session?.groupName || 'Lab'}!" << endl;\n    return 0;\n}\n`
+        }
+      ];
+    } else if (lang === 'java') {
+      defaultFiles = [
+        {
+          id: 'file-main',
+          name: 'Main.java',
+          language: 'python' as any,
+          content: `// ${session?.sessionTitle || 'Lab Session'}\n// Student: ${studentName} (${studentRegistrationId})\npublic class Main {\n    public static void main(String[] args) {\n        System.out.println("Welcome to ${session?.groupName || 'Lab'}!");\n    }\n}\n`
+        }
+      ];
+    } else {
+      defaultFiles = [
+        {
+          id: 'file-main',
+          name: 'index.html',
+          language: 'html',
+          content: `<!DOCTYPE html>\n<html>\n<head>\n  <title>${session?.sessionTitle || 'Lab'}</title>\n</head>\n<body>\n  <h1>${studentName}</h1>\n  <p>Student ID: ${studentRegistrationId}</p>\n</body>\n</html>`
+        }
+      ];
+    }
+
+    const studentId = `stud-${Date.now().toString().slice(-5)}-${Math.floor(Math.random() * 1000)}`;
+    const newState: LiveStudentState = {
+      studentId,
+      studentName,
+      studentRegistrationId,
+      studentEmail: `${studentRegistrationId.toLowerCase().replace(/[^a-z0-9]/g, '')}@student.edu`,
+      status: 'Active',
+      currentFileId: defaultFiles[0].id,
+      currentFileName: defaultFiles[0].name,
+      files: defaultFiles,
+      terminalOutput: `Lab session initialized for ${studentName} (${studentRegistrationId}). Ready to write and run code.\n`,
+      runCount: 0,
+      lastActivity: 'Joined lab session',
+      lastActivityTime: new Date().toISOString(),
+      progressPercentage: 0,
+      completedTaskIds: [],
+      helpRequest: null,
+      instructorNote: null,
+      joinTime: new Date().toISOString(),
+      timeInLabSeconds: 0
+    };
+
+    this.studentStates[sessionId][studentId] = newState;
+
+    if (session) {
+      session.joinedCount = Object.keys(this.studentStates[sessionId]).length;
+    }
+
+    this.logActivity({
+      id: `act-${Date.now()}-${Math.random().toString(36).substring(7)}`,
+      sessionId,
+      studentId,
+      eventType: 'JOINED_LAB',
+      description: `${studentName} (${studentRegistrationId}) joined session`,
+      createdAt: new Date().toISOString()
+    });
+
+    return newState;
   }
 
   // --- Live Student States ---
@@ -103,7 +239,7 @@ class LabDataStore {
     }
 
     const session = this.getSession(sessionId);
-    const assignment = session ? this.getAssignment(session.assignmentId) : undefined;
+    const assignment = session?.assignmentId ? this.getAssignment(session.assignmentId) : undefined;
     const starterFiles = assignment ? JSON.parse(JSON.stringify(assignment.starterFiles)) : [
       { id: 'f-1', name: 'main.py', language: 'python', content: '# Welcome to Lab\nprint("Hello World!")\n' }
     ];
@@ -188,6 +324,7 @@ class LabDataStore {
     if (!state) return undefined;
 
     state.terminalOutput = output;
+    state.runCount = (state.runCount || 0) + 1;
     state.lastExecution = {
       timestamp: new Date().toISOString(),
       status,
@@ -226,7 +363,7 @@ class LabDataStore {
     }
 
     const session = this.getSession(sessionId);
-    const assignment = session ? this.getAssignment(session.assignmentId) : undefined;
+    const assignment = session?.assignmentId ? this.getAssignment(session.assignmentId) : undefined;
     const totalTasks = assignment?.tasks.length || 1;
     state.progressPercentage = Math.round((state.completedTaskIds.length / totalTasks) * 100);
 

@@ -25,9 +25,10 @@ export function StudentGrid({ students, onFocusStudent }: StudentGridProps) {
     // Search filter
     if (search.trim()) {
       const q = search.toLowerCase();
-      const matchName = student.studentName.toLowerCase().includes(q);
-      const matchEmail = student.studentEmail.toLowerCase().includes(q);
-      if (!matchName && !matchEmail) return false;
+      const matchName = (student.studentName || '').toLowerCase().includes(q);
+      const matchEmail = (student.studentEmail || '').toLowerCase().includes(q);
+      const matchId = (student.studentRegistrationId || student.studentId || '').toLowerCase().includes(q);
+      if (!matchName && !matchEmail && !matchId) return false;
     }
 
     return true;
