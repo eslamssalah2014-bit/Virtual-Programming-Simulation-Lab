@@ -4,12 +4,8 @@ import React, { useState, useEffect, useRef, Suspense } from 'react';
 import { useParams, useSearchParams, useRouter } from 'next/navigation';
 import { LabSession } from '@/types';
 import { useAuth } from '@/lib/context/AuthContext';
-import {
-  UnifiedSignalingClient,
-  RTC_CONFIGURATION,
-  WebRTCLogEntry
-} from '@/lib/webrtc/signalingClient';
-import { WebRTCDebugPanel, WebRTCDebugInfo } from '@/components/common/WebRTCDebugPanel';
+import { ScreenShareManager, DiagnosticsState } from '@/lib/webrtc/screenShareManager';
+import { ScreenShareDiagnosticsPanel } from '@/components/common/ScreenShareDiagnosticsPanel';
 import { SessionDebugPanel, SessionDebugData } from '@/components/common/SessionDebugPanel';
 import { lookupSessionEverywhere, normalizeSessionId } from '@/lib/supabase/sessions';
 import {
@@ -18,7 +14,6 @@ import {
   Hand,
   HelpCircle,
   LogOut,
-  CheckCircle2,
   AlertCircle,
   Radio,
   User,
@@ -43,7 +38,7 @@ function StudentLabWorkstationContent() {
   const [joinError, setJoinError] = useState<string>('');
 
   const [session, setSession] = useState<LabSession | null>(null);
-  const [canonicalRoomId, setCanonicalRoomId] = useState<string>(rawSessionId);
+  const [canonicalRoomId, setCanonicalRoomId] = useState<string>(normalizeSessionId(rawSessionId));
   const [sessionDebugData, setSessionDebugData] = useState<SessionDebugData>({
     sessionId: normalizeSessionId(rawSessionId),
     sessionCode: normalizeSessionId(rawSessionId),
@@ -61,21 +56,28 @@ function StudentLabWorkstationContent() {
   const [activeHelpTicket, setActiveHelpTicket] = useState<string | null>(null);
   const [hasLeft, setHasLeft] = useState<boolean>(false);
 
-  // WebRTC Diagnostics State
-  const [peerConnectionState, setPeerConnectionState] = useState<string>('new');
-  const [iceConnectionState, setIceConnectionState] = useState<string>('new');
-  const [iceGatheringState, setIceGatheringState] = useState<string>('new');
-  const [signalingState, setSignalingState] = useState<string>('stable');
-  const [logs, setLogs] = useState<WebRTCLogEntry[]>([]);
+  // Diagnostics State
+  const [diagnostics, setDiagnostics] = useState<DiagnosticsState>({
+    sessionId: rawSessionId,
+    roomId: normalizeSessionId(rawSessionId),
+    studentConnected: true,
+    instructorConnected: false,
+    offerSent: false,
+    offerReceived: false,
+    answerSent: false,
+    answerReceived: false,
+    iceCandidatesSent: 0,
+    iceCandidatesReceived: 0,
+    connectionState: 'new',
+    iceState: 'new',
+    remoteStreamAttached: false,
+    failedStage: null,
+    errorMessage: null
+  });
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
-  const signalingRef = useRef<UnifiedSignalingClient | null>(null);
-
-  const addLog = (entry: WebRTCLogEntry) => {
-    setLogs(prev => [entry, ...prev.slice(0, 199)]);
-  };
+  const screenShareManagerRef = useRef<ScreenShareManager | null>(null);
 
   const getEffectiveStudentUid = () => {
     return studentId.trim() || currentUser?.id || `stud-${Date.now().toString().slice(-4)}`;
@@ -102,13 +104,9 @@ function StudentLabWorkstationContent() {
   useEffect(() => {
     async function resolveSession() {
       const result = await lookupSessionEverywhere(rawSessionId);
-      console.log(`[Student Lab URL Code]: ${result.logCode}`);
-      console.log(`[Student Lab Database Query]: ${result.logQuery}`);
-      console.log(`[Student Lab Result]: ${result.logResult}`);
-
       if (result.session) {
         setSession(result.session);
-        setCanonicalRoomId(result.session.id); // Matches instructor room format
+        setCanonicalRoomId(result.session.id);
         setSessionDebugData({
           sessionId: result.session.id,
           sessionCode: result.session.sessionCode || result.session.id,
@@ -126,106 +124,37 @@ function StudentLabWorkstationContent() {
     resolveSession();
   }, [rawSessionId]);
 
-  // 3. Initialize Unified Signaling Client ONLY after session is loaded from database (Requirement 6)
+  // 3. Initialize Rebuilt ScreenShareManager (deferred until session is loaded)
   useEffect(() => {
-    // Prevent WebRTC initialization until the session is successfully found and loaded
     if (!isIdentityConfirmed || hasLeft || !session || !session.id) return;
 
+    const cleanRoomId = normalizeSessionId(rawSessionId);
     const studentUid = getEffectiveStudentUid();
-    const signaling = new UnifiedSignalingClient(
-      rawSessionId,
-      canonicalRoomId,
-      studentUid,
-      'student',
-      addLog
-    );
-    signalingRef.current = signaling;
 
-    signaling.log(
-      `Student Station Connected | Raw: ${rawSessionId} | Canonical Room: ${canonicalRoomId} | Channel: ${signaling.channelName} | ID: ${studentUid}`,
-      'success',
-      'signaling'
-    );
-
-    // Notify presence to room
-    signaling.send('join_session', 'all', {
-      sessionId: canonicalRoomId,
-      rawSessionId,
-      studentId: studentUid,
-      studentName: studentName || currentUser.fullName,
-      studentRegistrationId: studentId
-    });
-
-    // 7. Answer received milestone handler
-    const unsubAnswer = signaling.on('webrtc_answer', async (data: any) => {
-      if (data.studentId && data.studentId !== studentUid && data.targetId !== studentUid) {
-        return;
-      }
-
-      signaling.log(
-        `[7. Answer received] Received WebRTC answer from instructor for student ${studentUid}`,
-        'success',
-        'signaling',
-        { sdpType: data.answer?.type }
-      );
-
-      const pc = peerConnectionRef.current;
-      if (pc && data.answer) {
-        try {
-          if (pc.signalingState === 'have-local-offer') {
-            await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
-            signaling.log(
-              `[Handshake Complete] Remote description set with instructor answer! State transitioning to connecting/connected...`,
-              'success',
-              'webrtc'
-            );
-            setSignalingState(pc.signalingState);
-            setPeerConnectionState(pc.connectionState);
-          }
-        } catch (err: any) {
-          signaling.log(`[WebRTC Handshake Error] Failed to set remote description: ${err.message}`, 'error', 'webrtc');
+    const manager = new ScreenShareManager({
+      role: 'student',
+      sessionId: rawSessionId,
+      roomId: cleanRoomId,
+      clientId: studentUid,
+      userName: studentName.trim() || currentUser?.fullName || 'Student',
+      onDiagnosticsChange: (state) => {
+        setDiagnostics(state);
+      },
+      onScreenSharingEnded: () => {
+        setIsScreenSharing(false);
+        if (videoRef.current) {
+          videoRef.current.srcObject = null;
         }
       }
     });
 
-    // 9. ICE candidate received milestone handler
-    const unsubCandidate = signaling.on('webrtc_ice_candidate', async (data: any) => {
-      if (data.fromRole === 'student' && data.senderId === studentUid) return;
-      if (data.studentId && data.studentId !== studentUid && data.targetId !== studentUid) return;
-
-      const pc = peerConnectionRef.current;
-      if (pc && data.candidate) {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-          signaling.log(
-            `[9. ICE candidate received] Added ICE candidate from instructor (${data.candidate.type || 'candidate'})`,
-            'info',
-            'ice'
-          );
-        } catch (err: any) {
-          signaling.log(`[ICE Error] Failed to add candidate: ${err.message}`, 'warn', 'ice');
-        }
-      }
-    });
-
-    // Handle participant updates
-    const unsubParticipant = signaling.on('participant_updated', (updated: any) => {
-      if (updated.studentRegistrationId === studentId || updated.studentId === studentUid) {
-        setIsHandRaised(updated.isHandRaised);
-        if (!updated.isHandRaised) {
-          setActiveHelpTicket(null);
-        }
-      }
-    });
+    screenShareManagerRef.current = manager;
 
     return () => {
-      unsubAnswer();
-      unsubCandidate();
-      unsubParticipant();
-      signaling.destroy();
-      signalingRef.current = null;
+      manager.destroy();
+      screenShareManagerRef.current = null;
     };
-  }, [rawSessionId, canonicalRoomId, isIdentityConfirmed, studentName, studentId, hasLeft]);
+  }, [rawSessionId, isIdentityConfirmed, studentName, studentId, hasLeft, session]);
 
   // Clean up media stream on unmount
   useEffect(() => {
@@ -233,9 +162,7 @@ function StudentLabWorkstationContent() {
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(track => track.stop());
       }
-      if (peerConnectionRef.current) {
-        peerConnectionRef.current.close();
-      }
+      screenShareManagerRef.current?.destroy();
     };
   }, []);
 
@@ -248,24 +175,6 @@ function StudentLabWorkstationContent() {
     setJoinError('');
 
     try {
-      const res = await fetch(`/api/sessions/${rawSessionId}/join`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          studentName: studentName.trim(),
-          studentRegistrationId: studentId.trim()
-        })
-      });
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to enter session');
-      }
-
-      if (data.session) {
-        setCanonicalRoomId(data.session.id);
-      }
-
       localStorage.setItem('vlab_student_name', studentName.trim());
       localStorage.setItem('vlab_student_id', studentId.trim());
       setIsIdentityConfirmed(true);
@@ -278,158 +187,25 @@ function StudentLabWorkstationContent() {
 
   // WebRTC Screen Sharing Implementation
   const handleStartScreenShare = async () => {
-    const signaling = signalingRef.current;
-    const studentUid = getEffectiveStudentUid();
+    if (!screenShareManagerRef.current) return;
 
     try {
-      signaling?.log('Requesting desktop screen capture via getDisplayMedia()...', 'info', 'media');
-
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: {
-          cursor: 'always',
-          displaySurface: 'monitor'
-        } as any,
-        audio: false
-      });
-
+      const stream = await screenShareManagerRef.current.startScreenShare();
       streamRef.current = stream;
-      signaling?.log(
-        `Screen stream captured successfully! ID: ${stream.id}, Tracks: ${stream.getVideoTracks().length}`,
-        'success',
-        'media'
-      );
 
       // Local preview assignment
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
       }
       setIsScreenSharing(true);
-
-      // 1. PeerConnection created milestone
-      if (peerConnectionRef.current) {
-        peerConnectionRef.current.close();
-      }
-
-      const pc = new RTCPeerConnection(RTC_CONFIGURATION);
-      peerConnectionRef.current = pc;
-
-      setPeerConnectionState(pc.connectionState);
-      setIceConnectionState(pc.iceConnectionState);
-      setIceGatheringState(pc.iceGatheringState);
-      setSignalingState(pc.signalingState);
-
-      signaling?.log(
-        `[1. PeerConnection created] RTCPeerConnection created with Google STUN servers`,
-        'success',
-        'webrtc'
-      );
-
-      // 11. Connection state changes milestone
-      pc.onconnectionstatechange = () => {
-        const state = pc.connectionState;
-        setPeerConnectionState(state);
-        signaling?.log(
-          `[11. Connection state changes] Connection state is now: ${state}`,
-          state === 'connected' ? 'success' : state === 'failed' ? 'error' : 'info',
-          'webrtc'
-        );
-      };
-
-      // 10. ICE connection state changes milestone
-      pc.oniceconnectionstatechange = () => {
-        const state = pc.iceConnectionState;
-        setIceConnectionState(state);
-        signaling?.log(
-          `[10. ICE connection state changes] ICE state is now: ${state}`,
-          state === 'connected' || state === 'completed' ? 'success' : state === 'failed' ? 'error' : 'info',
-          'ice'
-        );
-      };
-
-      pc.onicegatheringstatechange = () => {
-        setIceGatheringState(pc.iceGatheringState);
-      };
-
-      pc.onsignalingstatechange = () => {
-        setSignalingState(pc.signalingState);
-      };
-
-      // 8. ICE candidate generated milestone
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          signaling?.log(
-            `[8. ICE candidate generated] Generated local candidate (${event.candidate.type || 'candidate'}), forwarding to instructor`,
-            'info',
-            'ice'
-          );
-          signaling?.send('webrtc_ice_candidate', 'instructor', {
-            sessionId: canonicalRoomId,
-            studentId: studentUid,
-            candidate: event.candidate,
-            fromRole: 'student'
-          });
-        }
-      };
-
-      // Add tracks
-      stream.getTracks().forEach(track => {
-        pc.addTrack(track, stream);
-        signaling?.log(`Added track to RTCPeerConnection: ${track.kind} (${track.label || 'Screen'})`, 'success', 'webrtc');
-      });
-
-      // 2. Offer created milestone
-      signaling?.log('Creating WebRTC SDP offer...', 'info', 'webrtc');
-      const offer = await pc.createOffer({
-        offerToReceiveVideo: false,
-        offerToReceiveAudio: false
-      });
-
-      await pc.setLocalDescription(offer);
-      setSignalingState(pc.signalingState);
-      signaling?.log(
-        `[2. Offer created] SDP offer created and local description set (type: ${offer.type})`,
-        'success',
-        'webrtc'
-      );
-
-      // 3. Offer sent milestone
-      signaling?.send('webrtc_offer', 'instructor', {
-        sessionId: canonicalRoomId,
-        rawSessionId,
-        studentId: studentUid,
-        studentName: studentName.trim() || currentUser.fullName,
-        studentRegistrationId: studentId.trim(),
-        offer
-      });
-      signaling?.log(
-        `[3. Offer sent] WebRTC offer dispatched to instructor on channel ${signaling?.channelName}`,
-        'success',
-        'signaling'
-      );
-
-      // Notify screen status
-      signaling?.send('student_screen_status', 'instructor', {
-        sessionId: canonicalRoomId,
-        studentId: studentUid,
-        isScreenSharing: true
-      });
-
-      // Native browser stop sharing button
-      stream.getVideoTracks()[0].onended = () => {
-        signaling?.log('Screen share ended by browser chrome controls', 'warn', 'media');
-        handleStopScreenShare();
-      };
     } catch (err: any) {
-      signaling?.log(`[Screen Share Failed or Cancelled]: ${err.message}`, 'warn', 'media');
       console.warn('Screen share error:', err);
     }
   };
 
   // Stop Screen Sharing
   const handleStopScreenShare = () => {
-    const signaling = signalingRef.current;
-    const studentUid = getEffectiveStudentUid();
-
+    screenShareManagerRef.current?.stopScreenShare();
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
       streamRef.current = null;
@@ -437,164 +213,44 @@ function StudentLabWorkstationContent() {
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
-    if (peerConnectionRef.current) {
-      peerConnectionRef.current.close();
-      peerConnectionRef.current = null;
-    }
-
     setIsScreenSharing(false);
-    setPeerConnectionState('closed');
-    setIceConnectionState('closed');
-
-    signaling?.log('Screen sharing stopped and peer connection closed', 'info', 'media');
-
-    signaling?.send('student_screen_status', 'instructor', {
-      sessionId: canonicalRoomId,
-      studentId: studentUid,
-      isScreenSharing: false
-    });
   };
 
-  // Re-send Offer
-  const handleTriggerOffer = async () => {
-    const pc = peerConnectionRef.current;
-    const signaling = signalingRef.current;
-    const studentUid = getEffectiveStudentUid();
-
-    if (!pc || !isScreenSharing) {
-      handleStartScreenShare();
-      return;
-    }
-
-    try {
-      signaling?.log('Regenerating and re-sending WebRTC offer...', 'info', 'webrtc');
-      const offer = await pc.createOffer({ iceRestart: true });
-      await pc.setLocalDescription(offer);
-
-      signaling?.send('webrtc_offer', 'instructor', {
-        sessionId: canonicalRoomId,
-        studentId: studentUid,
-        studentName: studentName.trim() || currentUser.fullName,
-        studentRegistrationId: studentId.trim(),
-        offer
-      });
-      signaling?.log('[3. Offer sent] Re-sent WebRTC offer to instructor', 'success', 'signaling');
-    } catch (err: any) {
-      signaling?.log(`Re-offer error: ${err.message}`, 'error', 'webrtc');
-    }
-  };
-
-  // Force ICE Restart
-  const handleRestartIce = async () => {
-    const pc = peerConnectionRef.current;
-    const signaling = signalingRef.current;
-    const studentUid = getEffectiveStudentUid();
-
-    if (!pc || !isScreenSharing) {
-      signaling?.log('Cannot restart ICE: no active screen sharing peer connection', 'warn', 'ice');
-      return;
-    }
-
-    try {
-      signaling?.log('Triggering ICE Restart offer...', 'info', 'ice');
-      const offer = await pc.createOffer({ iceRestart: true });
-      await pc.setLocalDescription(offer);
-
-      signaling?.send('webrtc_offer', 'instructor', {
-        sessionId: canonicalRoomId,
-        studentId: studentUid,
-        studentName: studentName.trim() || currentUser.fullName,
-        studentRegistrationId: studentId.trim(),
-        offer
-      });
-      signaling?.log('[ICE Restart] Dispatched offer with iceRestart: true', 'success', 'ice');
-    } catch (err: any) {
-      signaling?.log(`ICE Restart error: ${err.message}`, 'error', 'ice');
-    }
-  };
-
-  // Raise / Lower Hand Toggle
+  // Raise / Lower Hand Action
   const handleToggleRaiseHand = () => {
-    const signaling = signalingRef.current;
-    const studentUid = getEffectiveStudentUid();
-
-    if (isHandRaised) {
-      signaling?.send('student_lower_hand', 'instructor', { sessionId: canonicalRoomId, studentId: studentUid });
-      setIsHandRaised(false);
-      setActiveHelpTicket(null);
-    } else {
-      signaling?.send('student_raise_hand', 'instructor', { sessionId: canonicalRoomId, studentId: studentUid });
-      setIsHandRaised(true);
-    }
+    const nextState = !isHandRaised;
+    setIsHandRaised(nextState);
   };
 
-  // Submit Need Help Ticket
+  // Request Help Action
   const handleSubmitHelp = (e: React.FormEvent) => {
     e.preventDefault();
     if (!helpMessage.trim()) return;
-
-    const signaling = signalingRef.current;
-    const studentUid = getEffectiveStudentUid();
-
-    signaling?.send('student_raise_hand', 'instructor', {
-      sessionId: canonicalRoomId,
-      studentId: studentUid,
-      message: helpMessage.trim()
-    });
-
-    setIsHandRaised(true);
     setActiveHelpTicket(helpMessage.trim());
+    setIsHandRaised(true);
     setIsHelpModalOpen(false);
     setHelpMessage('');
   };
 
-  // Leave Session
+  // Leave Lab Action
   const handleLeaveLab = () => {
-    const confirmed = window.confirm('Are you sure you want to leave this computer lab session?');
-    if (!confirmed) return;
-
-    handleStopScreenShare();
-
-    const signaling = signalingRef.current;
-    const studentUid = getEffectiveStudentUid();
-
-    signaling?.send('student_leave_lab', 'instructor', {
-      sessionId: canonicalRoomId,
-      studentId: studentUid
-    });
-
-    setHasLeft(true);
+    if (window.confirm('Are you sure you want to leave the lab workstation?')) {
+      handleStopScreenShare();
+      setHasLeft(true);
+    }
   };
 
-  // Construct Debug Object for Panel
-  const debugInfo: WebRTCDebugInfo = {
-    role: 'student',
-    rawSessionId,
-    canonicalRoomId,
-    channelName: signalingRef.current?.channelName || `vlab_webrtc_${canonicalRoomId}`,
-    screenSharingStatus: isScreenSharing,
-    streamId: streamRef.current?.id,
-    trackCount: streamRef.current?.getTracks().length || 0,
-    peerConnectionState,
-    iceConnectionState,
-    iceGatheringState,
-    signalingState,
-    remoteStreamStatus: isScreenSharing ? 'Transmitting to Instructor' : 'Stream Idle',
-    transports: signalingRef.current?.getTransportStatus()
-  };
-
-  // Left the lab view
+  // Session Exit Screen
   if (hasLeft) {
     return (
       <div className="min-h-[80vh] flex items-center justify-center p-4">
         <div className="bg-[#161b22] border border-gray-800 rounded-2xl p-8 max-w-md w-full text-center space-y-4 shadow-2xl">
-          <div className="w-14 h-14 rounded-full bg-gray-800 text-gray-400 flex items-center justify-center mx-auto">
-            <CheckCircle2 className="w-8 h-8 text-emerald-400" />
+          <div className="w-12 h-12 rounded-full bg-emerald-500/10 text-emerald-400 flex items-center justify-center mx-auto">
+            <Tv className="w-6 h-6" />
           </div>
-          <h2 className="text-xl font-bold text-white">Lab Session Ended</h2>
-          <p className="text-xs text-gray-400">
-            You have logged out of workstation station <strong>{studentId}</strong>. Your attendance and active screen
-            duration have been recorded.
+          <h2 className="text-lg font-bold text-white">Lab Session Concluded</h2>
+          <p className="text-xs text-gray-400 leading-relaxed">
+            You have disconnected from the live computer lab. Your attendance duration and participation have been logged.
           </p>
           <button
             onClick={() => router.push('/')}
@@ -728,14 +384,14 @@ function StudentLabWorkstationContent() {
             <span className="text-gray-400 text-[11px]">Peer:</span>
             <span
               className={`font-mono text-[11px] font-bold ${
-                peerConnectionState === 'connected'
+                diagnostics.connectionState === 'connected'
                   ? 'text-emerald-400'
-                  : peerConnectionState === 'connecting'
+                  : diagnostics.connectionState === 'connecting'
                   ? 'text-amber-400'
                   : 'text-gray-400'
               }`}
             >
-              {peerConnectionState}
+              {diagnostics.connectionState}
             </span>
           </div>
 
@@ -858,14 +514,11 @@ function StudentLabWorkstationContent() {
         )}
       </div>
 
-      {/* WebRTC Diagnostics & Debugging Panel */}
-      <WebRTCDebugPanel
-        debugInfo={debugInfo}
-        logs={logs}
-        onClearLogs={() => setLogs([])}
-        onRestartIce={handleRestartIce}
-        onTriggerOffer={handleTriggerOffer}
-        title="Student WebRTC Signaling & Stream Verification Console"
+      {/* Rebuilt 13-Milestone WebRTC Diagnostics Panel */}
+      <ScreenShareDiagnosticsPanel
+        diagnostics={diagnostics}
+        role="student"
+        onRestartIce={() => screenShareManagerRef.current?.restartIce()}
       />
 
       {/* Session Database & Lookup Diagnostics Panel */}
@@ -926,7 +579,7 @@ function StudentLabWorkstationContent() {
   );
 }
 
-export default function StudentLabWorkstationPage() {
+export default function StudentLabPage() {
   return (
     <Suspense
       fallback={
