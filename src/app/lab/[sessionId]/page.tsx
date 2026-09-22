@@ -4,9 +4,14 @@ import React, { useState, useEffect, useRef, Suspense } from 'react';
 import { useParams, useSearchParams, useRouter } from 'next/navigation';
 import { LabSession } from '@/types';
 import { useAuth } from '@/lib/context/AuthContext';
-import { ScreenShareManager, DiagnosticsState } from '@/lib/webrtc/screenShareManager';
-import { ScreenShareDiagnosticsPanel } from '@/components/common/ScreenShareDiagnosticsPanel';
-import { SessionDebugPanel, SessionDebugData } from '@/components/common/SessionDebugPanel';
+import {
+  PureSupabaseSignaling,
+  RTC_STUN_CONFIGURATION,
+  DiagnosticsState,
+  StageLog
+} from '@/lib/webrtc/pureSupabaseSignaling';
+import { SupabaseConfigGate } from '@/components/common/SupabaseConfigGate';
+import { WebRTCStageDiagnostics } from '@/components/common/WebRTCStageDiagnostics';
 import { lookupSessionEverywhere, normalizeSessionId } from '@/lib/supabase/sessions';
 import {
   MonitorPlay,
@@ -39,46 +44,30 @@ function StudentLabWorkstationContent() {
 
   const [session, setSession] = useState<LabSession | null>(null);
   const [canonicalRoomId, setCanonicalRoomId] = useState<string>(normalizeSessionId(rawSessionId));
-  const [sessionDebugData, setSessionDebugData] = useState<SessionDebugData>({
-    sessionId: normalizeSessionId(rawSessionId),
-    sessionCode: normalizeSessionId(rawSessionId),
-    sessionStatus: 'active',
-    databaseRecordFound: false,
-    extractedUrlCode: rawSessionId,
-    executedQuery: `SELECT * FROM sessions WHERE id = '${normalizeSessionId(rawSessionId)}'`,
-    returnedResult: 'Querying database...'
-  });
 
   const [isScreenSharing, setIsScreenSharing] = useState<boolean>(false);
   const [isHandRaised, setIsHandRaised] = useState<boolean>(false);
   const [isHelpModalOpen, setIsHelpModalOpen] = useState<boolean>(false);
   const [helpMessage, setHelpMessage] = useState<string>('');
-  const [activeHelpTicket, setActiveHelpTicket] = useState<string | null>(null);
   const [hasLeft, setHasLeft] = useState<boolean>(false);
 
   // Diagnostics State
   const [diagnostics, setDiagnostics] = useState<DiagnosticsState>({
-    sessionId: rawSessionId,
-    roomId: normalizeSessionId(rawSessionId),
-    studentConnected: true,
-    instructorConnected: false,
-    offerSent: false,
-    offerReceived: false,
-    answerSent: false,
-    answerReceived: false,
-    iceCandidatesSent: 0,
-    iceCandidatesReceived: 0,
-    connectionState: 'new',
-    iceState: 'new',
-    remoteStreamAttached: false,
-    failedStage: null,
-    errorMessage: null
+    signalingStatus: 'connecting',
+    offerStatus: 'pending',
+    answerStatus: 'pending',
+    iceStatus: { sent: 0, received: 0, connectionState: 'new', iceState: 'new' },
+    remoteStreamStatus: 'none',
+    channelName: `session:${normalizeSessionId(rawSessionId)}`,
+    sessionId: normalizeSessionId(rawSessionId),
+    logs: []
   });
-  const [signalingLogs, setSignalingLogs] = useState<any[]>([]);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const screenShareManagerRef = useRef<ScreenShareManager | null>(null);
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const signalingRef = useRef<PureSupabaseSignaling | null>(null);
+  const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
 
   const getEffectiveStudentUid = () => {
     return studentId.trim() || currentUser?.id || `stud-${Date.now().toString().slice(-4)}`;
@@ -101,62 +90,79 @@ function StudentLabWorkstationContent() {
     }
   }, [searchParams, currentUser]);
 
-  // 2. Fetch Session & Resolve Canonical Room ID via lookupSessionEverywhere
+  // 2. Fetch Session & Resolve Canonical Room ID
   useEffect(() => {
     async function resolveSession() {
       const result = await lookupSessionEverywhere(rawSessionId);
       if (result.session) {
         setSession(result.session);
         setCanonicalRoomId(result.session.id);
-        setSessionDebugData({
-          sessionId: result.session.id,
-          sessionCode: result.session.sessionCode || result.session.id,
-          sessionStatus: result.session.status || 'active',
-          startTime: result.session.startTime,
-          endTime: result.session.endTime,
-          databaseRecordFound: true,
-          foundIn: result.foundIn,
-          extractedUrlCode: result.logCode,
-          executedQuery: result.logQuery,
-          returnedResult: result.logResult
-        });
       }
     }
     resolveSession();
   }, [rawSessionId]);
 
-  // 3. Initialize Rebuilt ScreenShareManager (deferred until session is loaded)
+  // 3. Initialize Pure Supabase Realtime Signaling Client
   useEffect(() => {
     if (!isIdentityConfirmed || hasLeft || !session || !session.id) return;
 
     const cleanRoomId = normalizeSessionId(rawSessionId);
     const studentUid = getEffectiveStudentUid();
 
-    const manager = new ScreenShareManager({
+    const signaling = new PureSupabaseSignaling({
+      sessionId: cleanRoomId,
       role: 'student',
-      sessionId: rawSessionId,
-      roomId: cleanRoomId,
       clientId: studentUid,
-      userName: studentName.trim() || currentUser?.fullName || 'Student',
-      onDiagnosticsChange: (state) => {
-        setDiagnostics(state);
-      },
-      onLog: (entry) => {
-        setSignalingLogs(prev => [entry, ...prev.slice(0, 199)]);
-      },
-      onScreenSharingEnded: () => {
-        setIsScreenSharing(false);
-        if (videoRef.current) {
-          videoRef.current.srcObject = null;
-        }
+      onDiagnostics: (d) => setDiagnostics(d)
+    });
+
+    signalingRef.current = signaling;
+
+    // Connect to Supabase Realtime channel: session:<sessionId>
+    signaling.connect().then((connected) => {
+      if (connected) {
+        // Listen for Answer from Instructor
+        signaling.onAnswer(async (data) => {
+          const pc = peerConnectionRef.current;
+          if (!pc) return;
+
+          try {
+            if (pc.signalingState === 'have-local-offer') {
+              await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+              signaling.logStage('ANSWER_RECEIVED', `Applied remote SDP answer from instructor`);
+
+              // Flush any queued ICE candidates
+              for (const cand of pendingCandidatesRef.current) {
+                await pc.addIceCandidate(new RTCIceCandidate(cand));
+              }
+              pendingCandidatesRef.current = [];
+            }
+          } catch (err: any) {
+            console.error('Failed to set remote description on student:', err);
+          }
+        });
+
+        // Listen for ICE candidates from Instructor
+        signaling.onIceCandidate(async (data) => {
+          const pc = peerConnectionRef.current;
+          if (!pc) return;
+
+          if (pc.remoteDescription && pc.remoteDescription.type) {
+            try {
+              await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+            } catch (err) {
+              console.warn('Student addIceCandidate error:', err);
+            }
+          } else {
+            pendingCandidatesRef.current.push(data.candidate);
+          }
+        });
       }
     });
 
-    screenShareManagerRef.current = manager;
-
     return () => {
-      manager.destroy();
-      screenShareManagerRef.current = null;
+      signaling.destroy();
+      signalingRef.current = null;
     };
   }, [rawSessionId, isIdentityConfirmed, studentName, studentId, hasLeft, session]);
 
@@ -166,7 +172,9 @@ function StudentLabWorkstationContent() {
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(track => track.stop());
       }
-      screenShareManagerRef.current?.destroy();
+      if (peerConnectionRef.current) {
+        peerConnectionRef.current.close();
+      }
     };
   }, []);
 
@@ -191,25 +199,92 @@ function StudentLabWorkstationContent() {
 
   // WebRTC Screen Sharing Implementation
   const handleStartScreenShare = async () => {
-    if (!screenShareManagerRef.current) return;
+    const signaling = signalingRef.current;
+    if (!signaling) return;
+
+    const studentUid = getEffectiveStudentUid();
 
     try {
-      const stream = await screenShareManagerRef.current.startScreenShare();
-      streamRef.current = stream;
+      // Stage 1: SCREEN_CAPTURE_STARTED
+      signaling.logStage('SCREEN_CAPTURE_STARTED', 'Requesting monitor capture via navigator.mediaDevices.getDisplayMedia()');
 
-      // Local preview assignment
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { cursor: 'always' } as any,
+        audio: false
+      });
+
+      streamRef.current = stream;
+      const videoTrack = stream.getVideoTracks()[0];
+
+      if (!videoTrack) {
+        throw new Error('No video track found in captured screen stream');
+      }
+
+      // Local preview
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
       }
       setIsScreenSharing(true);
+
+      // Close previous connection if exists
+      if (peerConnectionRef.current) {
+        peerConnectionRef.current.close();
+      }
+
+      // Create RTCPeerConnection with STUN
+      const pc = new RTCPeerConnection(RTC_STUN_CONFIGURATION);
+      peerConnectionRef.current = pc;
+
+      pc.onconnectionstatechange = () => {
+        signaling.updateDiagnostics({
+          iceStatus: {
+            ...signaling.getDiagnostics().iceStatus,
+            connectionState: pc.connectionState
+          }
+        });
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        signaling.updateDiagnostics({
+          iceStatus: {
+            ...signaling.getDiagnostics().iceStatus,
+            iceState: pc.iceConnectionState
+          }
+        });
+      };
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          signaling.sendIceCandidate(studentUid, event.candidate, 'student');
+        }
+      };
+
+      // Stage 2: TRACKS_ADDED
+      pc.addTrack(videoTrack, stream);
+      signaling.logStage('TRACKS_ADDED', `Video track added to RTCPeerConnection: ${videoTrack.label}`);
+
+      // Handle native browser stop sharing
+      videoTrack.onended = () => {
+        handleStopScreenShare();
+      };
+
+      // Stage 3: OFFER_CREATED
+      const offer = await pc.createOffer({
+        offerToReceiveVideo: false,
+        offerToReceiveAudio: false
+      });
+      await pc.setLocalDescription(offer);
+      signaling.logStage('OFFER_CREATED', `SDP Offer created and local description set (type: ${offer.type})`);
+
+      // Stage 4: OFFER_SENT
+      await signaling.sendOffer(studentUid, studentName.trim() || currentUser?.fullName || 'Student', offer);
+
     } catch (err: any) {
-      console.warn('Screen share error:', err);
+      console.error('Screen share error:', err);
     }
   };
 
-  // Stop Screen Sharing
   const handleStopScreenShare = () => {
-    screenShareManagerRef.current?.stopScreenShare();
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
       streamRef.current = null;
@@ -217,26 +292,25 @@ function StudentLabWorkstationContent() {
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
+    }
     setIsScreenSharing(false);
   };
 
-  // Raise / Lower Hand Action
   const handleToggleRaiseHand = () => {
-    const nextState = !isHandRaised;
-    setIsHandRaised(nextState);
+    setIsHandRaised(!isHandRaised);
   };
 
-  // Request Help Action
   const handleSubmitHelp = (e: React.FormEvent) => {
     e.preventDefault();
     if (!helpMessage.trim()) return;
-    setActiveHelpTicket(helpMessage.trim());
     setIsHandRaised(true);
     setIsHelpModalOpen(false);
     setHelpMessage('');
   };
 
-  // Leave Lab Action
   const handleLeaveLab = () => {
     if (window.confirm('Are you sure you want to leave the lab workstation?')) {
       handleStopScreenShare();
@@ -244,7 +318,6 @@ function StudentLabWorkstationContent() {
     }
   };
 
-  // Session Exit Screen
   if (hasLeft) {
     return (
       <div className="min-h-[80vh] flex items-center justify-center p-4">
@@ -254,7 +327,7 @@ function StudentLabWorkstationContent() {
           </div>
           <h2 className="text-lg font-bold text-white">Lab Session Concluded</h2>
           <p className="text-xs text-gray-400 leading-relaxed">
-            You have disconnected from the live computer lab. Your attendance duration and participation have been logged.
+            You have disconnected from the live computer lab.
           </p>
           <button
             onClick={() => router.push('/')}
@@ -267,7 +340,6 @@ function StudentLabWorkstationContent() {
     );
   }
 
-  // Student Identity Form
   if (!isIdentityConfirmed) {
     return (
       <div className="min-h-[80vh] flex items-center justify-center p-4">
@@ -356,7 +428,6 @@ function StudentLabWorkstationContent() {
     );
   }
 
-  // Workstation View
   return (
     <div className="flex-1 bg-[#0a0d12] flex flex-col p-4 md:p-6 max-w-7xl mx-auto w-full space-y-5">
       {/* Top Station Header */}
@@ -383,22 +454,6 @@ function StudentLabWorkstationContent() {
 
         {/* Action Controls */}
         <div className="flex flex-wrap items-center gap-2.5">
-          <div className="flex items-center space-x-1.5 text-xs px-2.5 py-1.5 rounded-lg bg-gray-900 border border-gray-800">
-            <Radio className="w-3.5 h-3.5 text-cyan-400" />
-            <span className="text-gray-400 text-[11px]">Peer:</span>
-            <span
-              className={`font-mono text-[11px] font-bold ${
-                diagnostics.connectionState === 'connected'
-                  ? 'text-emerald-400'
-                  : diagnostics.connectionState === 'connecting'
-                  ? 'text-amber-400'
-                  : 'text-gray-400'
-              }`}
-            >
-              {diagnostics.connectionState}
-            </span>
-          </div>
-
           <button
             onClick={handleToggleRaiseHand}
             className={`px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition ${
@@ -429,27 +484,6 @@ function StudentLabWorkstationContent() {
         </div>
       </div>
 
-      {/* Raised Hand Active Banner */}
-      {isHandRaised && (
-        <div className="bg-amber-950/30 border border-amber-500/40 rounded-xl p-3 flex items-center justify-between text-xs text-amber-200 animate-in fade-in">
-          <div className="flex items-center space-x-2.5">
-            <Hand className="w-4 h-4 text-amber-400 animate-bounce shrink-0" />
-            <span>
-              Your hand is raised! The instructor has been alerted in their monitoring dashboard.
-              {activeHelpTicket && (
-                <span className="text-amber-300/80 ml-1 italic">Message: "{activeHelpTicket}"</span>
-              )}
-            </span>
-          </div>
-          <button
-            onClick={handleToggleRaiseHand}
-            className="px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 font-semibold border border-amber-500/40 text-[11px]"
-          >
-            Lower Hand
-          </button>
-        </div>
-      )}
-
       {/* Main Desktop Sharing Workstation Area */}
       <div className="flex-1 bg-[#12161f] border border-gray-800 rounded-2xl overflow-hidden flex flex-col items-center justify-center p-6 relative min-h-[460px] shadow-xl">
         {isScreenSharing ? (
@@ -465,9 +499,6 @@ function StudentLabWorkstationContent() {
               <div className="absolute top-3 left-3 bg-black/75 backdrop-blur-md px-3 py-1 rounded-full border border-emerald-500/40 flex items-center space-x-2 text-[11px] text-emerald-400 font-semibold shadow-md">
                 <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
                 <span>Transmitting Screen Stream to Instructor</span>
-              </div>
-              <div className="absolute bottom-3 right-3 bg-black/75 backdrop-blur-md px-3 py-1 rounded-lg border border-gray-700 text-[10px] text-gray-300 font-mono">
-                Stream ID: {streamRef.current?.id.substring(0, 12)}...
               </div>
             </div>
 
@@ -490,21 +521,8 @@ function StudentLabWorkstationContent() {
             <div className="space-y-1.5">
               <h2 className="text-lg font-bold text-white">Share Your Desktop Screen</h2>
               <p className="text-xs text-gray-400 max-w-sm mx-auto leading-relaxed">
-                Click below to select your screen or application window. Your instructor will observe your workstation
-                in real time for guidance and attendance validation.
+                Click below to select your screen or window. Your desktop stream is transmitted directly to the instructor via WebRTC through Supabase Realtime signaling.
               </p>
-            </div>
-
-            <div className="p-3 bg-gray-900/80 border border-gray-800 rounded-xl text-left space-y-2 text-[11px] text-gray-400">
-              <div className="flex items-center space-x-2 text-gray-300 font-semibold">
-                <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
-                <span>Lab Connection Readiness</span>
-              </div>
-              <ul className="space-y-1 list-disc list-inside text-gray-400 text-[10px]">
-                <li>Direct WebRTC PeerConnection with Google STUN</li>
-                <li>Full Desktop capture with mouse cursor enabled</li>
-                <li>Zero recorded storage: streams directly to instructor live</li>
-              </ul>
             </div>
 
             <button
@@ -518,68 +536,12 @@ function StudentLabWorkstationContent() {
         )}
       </div>
 
-      {/* Rebuilt 13-Milestone WebRTC Diagnostics Panel */}
-      <ScreenShareDiagnosticsPanel
+      {/* Requirement 11: Real WebRTC Stage Diagnostics Console */}
+      <WebRTCStageDiagnostics
         diagnostics={diagnostics}
         role="student"
-        logs={signalingLogs}
-        onRestartIce={() => screenShareManagerRef.current?.restartIce()}
+        title="Student WebRTC Realtime Signaling Diagnostics"
       />
-
-      {/* Session Database & Lookup Diagnostics Panel */}
-      <SessionDebugPanel debugData={sessionDebugData} />
-
-      {/* Need Help Ticket Modal */}
-      {isHelpModalOpen && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-[#161b22] border border-gray-700 rounded-2xl p-6 max-w-md w-full space-y-4 shadow-2xl">
-            <div className="flex items-center justify-between border-b border-gray-800 pb-3">
-              <div className="flex items-center space-x-2 text-white font-bold text-sm">
-                <HelpCircle className="w-4 h-4 text-cyan-400" />
-                <span>Request Instructor Assistance</span>
-              </div>
-              <button
-                onClick={() => setIsHelpModalOpen(false)}
-                className="text-gray-400 hover:text-white text-xs font-mono"
-              >
-                ✕
-              </button>
-            </div>
-
-            <form onSubmit={handleSubmitHelp} className="space-y-4">
-              <div>
-                <label className="block text-xs font-semibold text-gray-300 mb-1.5">
-                  Briefly describe what you need help with:
-                </label>
-                <textarea
-                  rows={3}
-                  required
-                  placeholder="e.g. Screen sharing permission error, question regarding the lab exercise..."
-                  value={helpMessage}
-                  onChange={e => setHelpMessage(e.target.value)}
-                  className="w-full bg-[#0d1117] border border-gray-700 rounded-lg p-3 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-cyan-500 resize-none"
-                />
-              </div>
-
-              <div className="flex items-center justify-end space-x-2 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setIsHelpModalOpen(false)}
-                  className="px-3.5 py-2 rounded-lg bg-gray-800 text-gray-300 hover:text-white text-xs font-semibold"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="px-4 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold transition shadow-md"
-                >
-                  Send Help Request
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -593,7 +555,9 @@ export default function StudentLabPage() {
         </div>
       }
     >
-      <StudentLabWorkstationContent />
+      <SupabaseConfigGate>
+        <StudentLabWorkstationContent />
+      </SupabaseConfigGate>
     </Suspense>
   );
 }
