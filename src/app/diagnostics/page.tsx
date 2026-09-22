@@ -18,6 +18,18 @@ export default function DiagnosticsPage() {
     remoteStreamStatus: 'none',
     channelName: 'session:test-session-101',
     sessionId: 'test-session-101',
+    audit: {
+      trackCaptured: { status: 'pending' },
+      trackAdded: { status: 'pending' },
+      offerSent: { status: 'pending' },
+      offerReceived: { status: 'pending' },
+      answerSent: { status: 'pending' },
+      answerReceived: { status: 'pending' },
+      iceConnected: { status: 'pending' },
+      onTrackFired: { status: 'pending' },
+      videoAttached: { status: 'pending' },
+      failingStage: null
+    },
     logs: []
   });
 

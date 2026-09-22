@@ -60,6 +60,18 @@ function StudentLabWorkstationContent() {
     remoteStreamStatus: 'none',
     channelName: `session:${normalizeSessionId(rawSessionId)}`,
     sessionId: normalizeSessionId(rawSessionId),
+    audit: {
+      trackCaptured: { status: 'pending' },
+      trackAdded: { status: 'pending' },
+      offerSent: { status: 'pending' },
+      offerReceived: { status: 'pending' },
+      answerSent: { status: 'pending' },
+      answerReceived: { status: 'pending' },
+      iceConnected: { status: 'pending' },
+      onTrackFired: { status: 'pending' },
+      videoAttached: { status: 'pending' },
+      failingStage: null
+    },
     logs: []
   });
 
@@ -72,6 +84,27 @@ function StudentLabWorkstationContent() {
   const getEffectiveStudentUid = () => {
     return studentId.trim() || currentUser?.id || `stud-${Date.now().toString().slice(-4)}`;
   };
+
+  // Requirement 5: Print connectionState, iceConnectionState, signalingState every 2 seconds
+  useEffect(() => {
+    const auditInterval = setInterval(() => {
+      const pc = peerConnectionRef.current;
+      if (pc) {
+        console.log('[STUDENT WebRTC 2s Audit]', {
+          connectionState: pc.connectionState,
+          iceConnectionState: pc.iceConnectionState,
+          signalingState: pc.signalingState,
+          sendersCount: pc.getSenders().length,
+          transceivers: pc.getTransceivers().map(t => ({
+            kind: t.sender.track?.kind || t.receiver.track?.kind,
+            direction: t.direction,
+            currentDirection: t.currentDirection
+          }))
+        });
+      }
+    }, 2000);
+    return () => clearInterval(auditInterval);
+  }, []);
 
   // 1. Initial Identity Check
   useEffect(() => {
@@ -139,6 +172,7 @@ function StudentLabWorkstationContent() {
             }
           } catch (err: any) {
             console.error('Failed to set remote description on student:', err);
+            signaling.reportFailure('Answer Received', err?.message || 'Failed to apply remote answer');
           }
         });
 
@@ -155,6 +189,14 @@ function StudentLabWorkstationContent() {
             }
           } else {
             pendingCandidatesRef.current.push(data.candidate);
+          }
+        });
+
+        // Listen for offer requests from instructor (reconnection or join after share started)
+        signaling.onRequestOffer(async () => {
+          console.log('[STUDENT] Instructor requested active desktop stream offer');
+          if (streamRef.current) {
+            await createAndSendOffer(streamRef.current);
           }
         });
       }
@@ -197,17 +239,128 @@ function StudentLabWorkstationContent() {
     }
   };
 
+  // Dedicated WebRTC Offer Creation & Dispatch with strict Audits
+  const createAndSendOffer = async (existingStream?: MediaStream) => {
+    const signaling = signalingRef.current;
+    if (!signaling) return;
+
+    const stream = existingStream || streamRef.current;
+    if (!stream) {
+      signaling.reportFailure('Track Captured', 'No active display stream available to create offer');
+      return;
+    }
+
+    const studentUid = getEffectiveStudentUid();
+
+    try {
+      // 1. Verify stream.getVideoTracks().length > 0
+      const videoTracks = stream.getVideoTracks();
+      if (videoTracks.length === 0) {
+        signaling.reportFailure('Track Captured', 'stream.getVideoTracks().length is 0');
+        return;
+      }
+
+      console.log('TRACK_CAPTURED', videoTracks);
+      signaling.logStage('TRACK_CAPTURED', `Captured ${videoTracks.length} video track(s): ${videoTracks[0].label}`);
+
+      // Close previous connection if exists
+      if (peerConnectionRef.current) {
+        peerConnectionRef.current.close();
+      }
+
+      const pc = new RTCPeerConnection(RTC_STUN_CONFIGURATION);
+      peerConnectionRef.current = pc;
+
+      pc.onconnectionstatechange = () => {
+        console.log(`[STUDENT ConnectionState]: ${pc.connectionState}`);
+        signaling.updateDiagnostics({
+          iceStatus: {
+            ...signaling.getDiagnostics().iceStatus,
+            connectionState: pc.connectionState
+          }
+        });
+        if (pc.connectionState === 'connected') {
+          signaling.logStage('ICE_CONNECTED', 'WebRTC connection established');
+        } else if (pc.connectionState === 'failed') {
+          signaling.reportFailure('ICE Connected', 'Connection state FAILED');
+        }
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        console.log(`[STUDENT ICEConnectionState]: ${pc.iceConnectionState}`);
+        signaling.updateDiagnostics({
+          iceStatus: {
+            ...signaling.getDiagnostics().iceStatus,
+            iceState: pc.iceConnectionState
+          }
+        });
+        if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+          signaling.logStage('ICE_CONNECTED', `ICE state: ${pc.iceConnectionState}`);
+        } else if (pc.iceConnectionState === 'failed') {
+          signaling.reportFailure('ICE Connected', 'ICE state FAILED');
+        }
+      };
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          signaling.sendIceCandidate(studentUid, event.candidate, 'student');
+        }
+      };
+
+      // 1. Verify every track is added:
+      stream.getTracks().forEach(track => {
+        pc.addTrack(track, stream);
+      });
+
+      console.log('TRACK_ADDED_TO_PEER', pc.getSenders());
+      signaling.logStage('TRACK_ADDED_TO_PEER', `Tracks added to RTCPeerConnection. Senders: ${pc.getSenders().length}`);
+
+      // 1. Print sender count:
+      console.log('pc.getSenders() count:', pc.getSenders().length);
+
+      // 4. Verify video transceiver direction is sendrecv NOT inactive recvonly
+      pc.getTransceivers().forEach(t => {
+        if (t.sender.track?.kind === 'video') {
+          t.direction = 'sendrecv';
+          console.log('Student video transceiver direction set to:', t.direction);
+        }
+      });
+
+      // 4. Create Offer with video receive capability to enforce sendrecv negotiation
+      const offer = await pc.createOffer({
+        offerToReceiveVideo: true,
+        offerToReceiveAudio: false
+      });
+
+      // 4. Verify offer SDP contains: m=video
+      const offerHasVideo = offer.sdp ? offer.sdp.includes('m=video') : false;
+      console.log('OFFER SDP m=video check:', offerHasVideo);
+      if (!offerHasVideo) {
+        signaling.reportFailure('Offer Sent', 'Offer SDP does not contain m=video');
+        return;
+      }
+
+      await pc.setLocalDescription(offer);
+      signaling.logStage('OFFER_CREATED', `SDP Offer created (type: ${offer.type}, m=video present, sendrecv)`);
+
+      // Stage: OFFER_SENT
+      await signaling.sendOffer(studentUid, studentName.trim() || currentUser?.fullName || 'Student', offer);
+
+    } catch (err: any) {
+      console.error('Error creating student screen share offer:', err);
+      signaling.reportFailure('Offer Created', err?.message || 'Failed to create offer');
+    }
+  };
+
   // WebRTC Screen Sharing Implementation
   const handleStartScreenShare = async () => {
     const signaling = signalingRef.current;
     if (!signaling) return;
 
-    const studentUid = getEffectiveStudentUid();
-
     try {
-      // Stage 1: SCREEN_CAPTURE_STARTED
       signaling.logStage('SCREEN_CAPTURE_STARTED', 'Requesting monitor capture via navigator.mediaDevices.getDisplayMedia()');
 
+      // 1. On STUDENT side: const stream = await navigator.mediaDevices.getDisplayMedia()
       const stream = await navigator.mediaDevices.getDisplayMedia({
         video: { cursor: 'always' } as any,
         audio: false
@@ -217,6 +370,7 @@ function StudentLabWorkstationContent() {
       const videoTrack = stream.getVideoTracks()[0];
 
       if (!videoTrack) {
+        signaling.reportFailure('Track Captured', 'No video track found in captured screen stream');
         throw new Error('No video track found in captured screen stream');
       }
 
@@ -226,61 +380,19 @@ function StudentLabWorkstationContent() {
       }
       setIsScreenSharing(true);
 
-      // Close previous connection if exists
-      if (peerConnectionRef.current) {
-        peerConnectionRef.current.close();
-      }
-
-      // Create RTCPeerConnection with STUN
-      const pc = new RTCPeerConnection(RTC_STUN_CONFIGURATION);
-      peerConnectionRef.current = pc;
-
-      pc.onconnectionstatechange = () => {
-        signaling.updateDiagnostics({
-          iceStatus: {
-            ...signaling.getDiagnostics().iceStatus,
-            connectionState: pc.connectionState
-          }
-        });
-      };
-
-      pc.oniceconnectionstatechange = () => {
-        signaling.updateDiagnostics({
-          iceStatus: {
-            ...signaling.getDiagnostics().iceStatus,
-            iceState: pc.iceConnectionState
-          }
-        });
-      };
-
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          signaling.sendIceCandidate(studentUid, event.candidate, 'student');
-        }
-      };
-
-      // Stage 2: TRACKS_ADDED
-      pc.addTrack(videoTrack, stream);
-      signaling.logStage('TRACKS_ADDED', `Video track added to RTCPeerConnection: ${videoTrack.label}`);
-
       // Handle native browser stop sharing
       videoTrack.onended = () => {
         handleStopScreenShare();
       };
 
-      // Stage 3: OFFER_CREATED
-      const offer = await pc.createOffer({
-        offerToReceiveVideo: false,
-        offerToReceiveAudio: false
-      });
-      await pc.setLocalDescription(offer);
-      signaling.logStage('OFFER_CREATED', `SDP Offer created and local description set (type: ${offer.type})`);
-
-      // Stage 4: OFFER_SENT
-      await signaling.sendOffer(studentUid, studentName.trim() || currentUser?.fullName || 'Student', offer);
+      // Perform full WebRTC negotiation with all audits
+      await createAndSendOffer(stream);
 
     } catch (err: any) {
       console.error('Screen share error:', err);
+      if (err.name !== 'NotAllowedError') {
+        signaling.reportFailure('Track Captured', err?.message || 'Screen capture error');
+      }
     }
   };
 

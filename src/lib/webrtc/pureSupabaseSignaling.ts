@@ -13,6 +13,8 @@ export const RTC_STUN_CONFIGURATION: RTCConfiguration = {
 
 export type StageName =
   | 'SCREEN_CAPTURE_STARTED'
+  | 'TRACK_CAPTURED'
+  | 'TRACK_ADDED_TO_PEER'
   | 'TRACKS_ADDED'
   | 'OFFER_CREATED'
   | 'OFFER_SENT'
@@ -22,6 +24,7 @@ export type StageName =
   | 'ANSWER_RECEIVED'
   | 'ICE_SENT'
   | 'ICE_RECEIVED'
+  | 'ICE_CONNECTED'
   | 'ONTRACK_FIRED'
   | 'VIDEO_ATTACHED';
 
@@ -34,6 +37,26 @@ export interface StageLog {
   data?: any;
 }
 
+export interface AuditStageDetail {
+  status: 'pending' | 'success' | 'failed';
+  details?: string;
+  timestamp?: string;
+  extra?: any;
+}
+
+export interface MediaAuditState {
+  trackCaptured: AuditStageDetail;
+  trackAdded: AuditStageDetail;
+  offerSent: AuditStageDetail;
+  offerReceived: AuditStageDetail;
+  answerSent: AuditStageDetail;
+  answerReceived: AuditStageDetail;
+  iceConnected: AuditStageDetail;
+  onTrackFired: AuditStageDetail;
+  videoAttached: AuditStageDetail;
+  failingStage: { stage: string; reason: string } | null;
+}
+
 export interface DiagnosticsState {
   signalingStatus: 'connecting' | 'connected' | 'error' | 'disconnected';
   offerStatus: 'pending' | 'created' | 'sent' | 'received';
@@ -43,6 +66,7 @@ export interface DiagnosticsState {
   activeTrackLabel?: string;
   channelName: string;
   sessionId: string;
+  audit: MediaAuditState;
   logs: StageLog[];
 }
 
@@ -67,7 +91,6 @@ export class PureSupabaseSignaling {
     onDiagnostics?: (diag: DiagnosticsState) => void;
   }) {
     this.sessionId = options.sessionId;
-    // Requirement 2: Create a signaling channel per session: session:<sessionId>
     this.channelName = `session:${this.sessionId}`;
     this.role = options.role;
     this.clientId = options.clientId;
@@ -82,6 +105,18 @@ export class PureSupabaseSignaling {
       remoteStreamStatus: 'none',
       channelName: this.channelName,
       sessionId: this.sessionId,
+      audit: {
+        trackCaptured: { status: 'pending' },
+        trackAdded: { status: 'pending' },
+        offerSent: { status: 'pending' },
+        offerReceived: { status: 'pending' },
+        answerSent: { status: 'pending' },
+        answerReceived: { status: 'pending' },
+        iceConnected: { status: 'pending' },
+        onTrackFired: { status: 'pending' },
+        videoAttached: { status: 'pending' },
+        failingStage: null
+      },
       logs: []
     };
   }
@@ -105,9 +140,43 @@ export class PureSupabaseSignaling {
 
     this.diagnostics.logs = [entry, ...this.diagnostics.logs.slice(0, 199)];
 
+    // Sync to 9-stage audit
+    const nowTime = entry.timestamp;
+    if (stage === 'TRACK_CAPTURED') {
+      this.diagnostics.audit.trackCaptured = { status: 'success', details: message, timestamp: nowTime, extra: data };
+    } else if (stage === 'TRACK_ADDED_TO_PEER' || stage === 'TRACKS_ADDED') {
+      this.diagnostics.audit.trackAdded = { status: 'success', details: message, timestamp: nowTime, extra: data };
+    } else if (stage === 'OFFER_SENT') {
+      this.diagnostics.audit.offerSent = { status: 'success', details: message, timestamp: nowTime, extra: data };
+    } else if (stage === 'OFFER_RECEIVED') {
+      this.diagnostics.audit.offerReceived = { status: 'success', details: message, timestamp: nowTime, extra: data };
+    } else if (stage === 'ANSWER_SENT') {
+      this.diagnostics.audit.answerSent = { status: 'success', details: message, timestamp: nowTime, extra: data };
+    } else if (stage === 'ANSWER_RECEIVED') {
+      this.diagnostics.audit.answerReceived = { status: 'success', details: message, timestamp: nowTime, extra: data };
+    } else if (stage === 'ICE_CONNECTED') {
+      this.diagnostics.audit.iceConnected = { status: 'success', details: message, timestamp: nowTime, extra: data };
+    } else if (stage === 'ONTRACK_FIRED') {
+      this.diagnostics.audit.onTrackFired = { status: 'success', details: message, timestamp: nowTime, extra: data };
+    } else if (stage === 'VIDEO_ATTACHED') {
+      this.diagnostics.audit.videoAttached = { status: 'success', details: message, timestamp: nowTime, extra: data };
+      this.diagnostics.audit.failingStage = null;
+    }
+
     if (this.onLogCallback) {
       this.onLogCallback(entry);
     }
+    this.notifyDiagnostics();
+  }
+
+  public reportFailure(stageName: string, reason: string) {
+    console.error(`[WEBRTC_AUDIT_FAILURE] ${stageName}: ${reason}`);
+    this.diagnostics.audit.failingStage = { stage: stageName, reason };
+    this.notifyDiagnostics();
+  }
+
+  public updateAudit(partial: Partial<MediaAuditState>) {
+    this.diagnostics.audit = { ...this.diagnostics.audit, ...partial };
     this.notifyDiagnostics();
   }
 
@@ -132,13 +201,13 @@ export class PureSupabaseSignaling {
     if (!this.supabase) {
       console.error('No Supabase client configured.');
       this.updateDiagnostics({ signalingStatus: 'error' });
+      this.reportFailure('Signaling Transport', 'Supabase client is not configured or missing credentials');
       return false;
     }
 
     try {
       this.updateDiagnostics({ signalingStatus: 'connecting' });
 
-      // Requirement 2: session:<sessionId>
       this.channel = this.supabase.channel(this.channelName, {
         config: {
           broadcast: { self: false, ack: true }
@@ -156,15 +225,17 @@ export class PureSupabaseSignaling {
           } else if (status === 'CHANNEL_ERROR') {
             this.updateDiagnostics({ signalingStatus: 'error' });
             console.error(`[Supabase Realtime] Error on channel ${this.channelName}`);
+            this.reportFailure('Signaling Transport', `Channel subscription error on ${this.channelName}`);
             resolve(false);
           } else if (status === 'CLOSED') {
             this.updateDiagnostics({ signalingStatus: 'disconnected' });
           }
         });
       });
-    } catch (err) {
+    } catch (err: any) {
       console.error('Supabase Realtime connect error:', err);
       this.updateDiagnostics({ signalingStatus: 'error' });
+      this.reportFailure('Signaling Transport', err?.message || 'Failed to connect to Supabase channel');
       return false;
     }
   }
@@ -172,7 +243,11 @@ export class PureSupabaseSignaling {
   public onOffer(handler: (data: { studentId: string; studentName?: string; offer: RTCSessionDescriptionInit }) => void) {
     this.channel?.on('broadcast', { event: 'webrtc_offer' }, ({ payload }) => {
       if (!payload || !payload.offer) return;
-      this.logStage('OFFER_RECEIVED', `Received SDP offer from student ${payload.studentId}`, { sdpType: payload.offer.type });
+      this.logStage('OFFER_RECEIVED', `Received SDP offer from student ${payload.studentId}`, {
+        sdpType: payload.offer.type,
+        sdpLength: payload.offer.sdp?.length,
+        hasVideo: payload.offer.sdp?.includes('m=video')
+      });
       this.updateDiagnostics({ offerStatus: 'received' });
       handler(payload);
     });
@@ -184,7 +259,10 @@ export class PureSupabaseSignaling {
       if (payload.targetId && payload.targetId !== this.clientId && payload.studentId !== this.clientId) {
         return;
       }
-      this.logStage('ANSWER_RECEIVED', `Received SDP answer from instructor for student ${payload.studentId}`, { sdpType: payload.answer.type });
+      this.logStage('ANSWER_RECEIVED', `Received SDP answer from instructor for student ${payload.studentId}`, {
+        sdpType: payload.answer.type,
+        hasVideo: payload.answer.sdp?.includes('m=video')
+      });
       this.updateDiagnostics({ answerStatus: 'received' });
       handler(payload);
     });
@@ -207,9 +285,29 @@ export class PureSupabaseSignaling {
     });
   }
 
+  public onRequestOffer(handler: () => void) {
+    this.channel?.on('broadcast', { event: 'webrtc_request_offer' }, () => {
+      console.log(`[Supabase Realtime] Received offer request from instructor on ${this.channelName}`);
+      handler();
+    });
+  }
+
+  public async sendOfferRequest() {
+    if (!this.channel) return;
+    console.log(`[Supabase Realtime] Requesting active student offers on channel ${this.channelName}`);
+    await this.channel.send({
+      type: 'broadcast',
+      event: 'webrtc_request_offer',
+      payload: { sessionId: this.sessionId, timestamp: Date.now() }
+    });
+  }
+
   public async sendOffer(studentId: string, studentName: string, offer: RTCSessionDescriptionInit) {
     if (!this.channel) return;
-    this.logStage('OFFER_SENT', `Dispatching SDP offer to instructor on channel ${this.channelName}`, { sdpType: offer.type });
+    this.logStage('OFFER_SENT', `Dispatching SDP offer to instructor on channel ${this.channelName}`, {
+      sdpType: offer.type,
+      hasVideo: offer.sdp?.includes('m=video')
+    });
     this.updateDiagnostics({ offerStatus: 'sent' });
 
     await this.channel.send({
@@ -227,7 +325,10 @@ export class PureSupabaseSignaling {
 
   public async sendAnswer(studentId: string, answer: RTCSessionDescriptionInit) {
     if (!this.channel) return;
-    this.logStage('ANSWER_SENT', `Dispatching SDP answer to student ${studentId} on channel ${this.channelName}`, { sdpType: answer.type });
+    this.logStage('ANSWER_SENT', `Dispatching SDP answer to student ${studentId} on channel ${this.channelName}`, {
+      sdpType: answer.type,
+      hasVideo: answer.sdp?.includes('m=video')
+    });
     this.updateDiagnostics({ answerStatus: 'sent' });
 
     await this.channel.send({

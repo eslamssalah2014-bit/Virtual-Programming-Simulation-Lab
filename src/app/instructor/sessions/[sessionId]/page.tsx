@@ -50,6 +50,18 @@ function InstructorLiveSessionContent() {
     remoteStreamStatus: 'none',
     channelName: `session:${normalizeSessionId(rawSessionId)}`,
     sessionId: normalizeSessionId(rawSessionId),
+    audit: {
+      trackCaptured: { status: 'pending' },
+      trackAdded: { status: 'pending' },
+      offerSent: { status: 'pending' },
+      offerReceived: { status: 'pending' },
+      answerSent: { status: 'pending' },
+      answerReceived: { status: 'pending' },
+      iceConnected: { status: 'pending' },
+      onTrackFired: { status: 'pending' },
+      videoAttached: { status: 'pending' },
+      failingStage: null
+    },
     logs: []
   });
 
@@ -60,6 +72,26 @@ function InstructorLiveSessionContent() {
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const pendingCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
   const focusVideoRef = useRef<HTMLVideoElement | null>(null);
+
+  // Requirement 5: Print connectionState, iceConnectionState, signalingState every 2 seconds
+  useEffect(() => {
+    const auditInterval = setInterval(() => {
+      peerConnectionsRef.current.forEach((pc, studentId) => {
+        console.log(`[INSTRUCTOR WebRTC 2s Audit - Student: ${studentId}]`, {
+          connectionState: pc.connectionState,
+          iceConnectionState: pc.iceConnectionState,
+          signalingState: pc.signalingState,
+          receiversCount: pc.getReceivers().length,
+          transceivers: pc.getTransceivers().map(t => ({
+            kind: t.receiver?.track?.kind || t.sender?.track?.kind,
+            direction: t.direction,
+            currentDirection: t.currentDirection
+          }))
+        });
+      });
+    }, 2000);
+    return () => clearInterval(auditInterval);
+  }, []);
 
   // 1. Fetch Session Info
   useEffect(() => {
@@ -90,7 +122,7 @@ function InstructorLiveSessionContent() {
   useEffect(() => {
     if (!session || !session.id) return;
 
-    const cleanRoomId = session.id;
+    const cleanRoomId = normalizeSessionId(session.id);
 
     // Requirement 1 & 2: Supabase Realtime signaling on session:<sessionId>
     const signaling = new PureSupabaseSignaling({
@@ -102,13 +134,25 @@ function InstructorLiveSessionContent() {
 
     signalingRef.current = signaling;
 
-    signaling.connect().then((connected) => {
+    signaling.connect().then(async (connected) => {
       if (!connected) return;
+
+      // Broadcast request for active student offers (in case student started sharing before instructor joined)
+      await signaling.sendOfferRequest();
 
       // Requirement 4: Instructor receives SDP Offer from student
       signaling.onOffer(async (data) => {
         const { studentId, studentName, offer } = data;
         if (!studentId || !offer) return;
+
+        console.log(`[INSTRUCTOR] Received SDP Offer from student ${studentId}:`, offer);
+
+        // 4. Verify that offer SDP contains: m=video
+        const offerHasVideo = offer.sdp ? offer.sdp.includes('m=video') : false;
+        console.log('OFFER SDP contains m=video:', offerHasVideo);
+        if (!offerHasVideo) {
+          signaling.reportFailure('Offer Received', 'Received SDP offer is missing m=video media description');
+        }
 
         // Reset any existing connection for this student
         if (peerConnectionsRef.current.has(studentId)) {
@@ -120,21 +164,33 @@ function InstructorLiveSessionContent() {
         peerConnectionsRef.current.set(studentId, pc);
 
         pc.onconnectionstatechange = () => {
+          console.log(`[INSTRUCTOR ConnectionState for ${studentId}]: ${pc.connectionState}`);
           signaling.updateDiagnostics({
             iceStatus: {
               ...signaling.getDiagnostics().iceStatus,
               connectionState: pc.connectionState
             }
           });
+          if (pc.connectionState === 'connected') {
+            signaling.logStage('ICE_CONNECTED', `PeerConnection connected for student ${studentId}`);
+          } else if (pc.connectionState === 'failed') {
+            signaling.reportFailure('ICE Connected', `PeerConnection state FAILED for student ${studentId}`);
+          }
         };
 
         pc.oniceconnectionstatechange = () => {
+          console.log(`[INSTRUCTOR ICEConnectionState for ${studentId}]: ${pc.iceConnectionState}`);
           signaling.updateDiagnostics({
             iceStatus: {
               ...signaling.getDiagnostics().iceStatus,
               iceState: pc.iceConnectionState
             }
           });
+          if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+            signaling.logStage('ICE_CONNECTED', `ICE connection connected for student ${studentId}`);
+          } else if (pc.iceConnectionState === 'failed') {
+            signaling.reportFailure('ICE Connected', `ICE connection FAILED for student ${studentId}`);
+          }
         };
 
         // Requirement 5: Instructor sends ICE candidates
@@ -144,18 +200,24 @@ function InstructorLiveSessionContent() {
           }
         };
 
-        // Requirement 8: Instructor video element MUST attach stream inside video.srcObject = event.streams[0]
+        // 4. Pre-add video transceiver with sendrecv
+        try {
+          pc.addTransceiver('video', { direction: 'sendrecv' });
+        } catch (e) {
+          console.warn('addTransceiver video error:', e);
+        }
+
+        // 2. On the INSTRUCTOR side: Verify pc.ontrack = (event) => { console.log("ONTRACK FIRED", event) }
         pc.ontrack = (event) => {
-          // Requirement 7: ONTRACK_FIRED
+          console.log("ONTRACK FIRED", event);
+
           signaling.logStage('ONTRACK_FIRED', `pc.ontrack received live desktop track: ${event.track.label} (${event.track.readyState})`, {
             trackKind: event.track.kind,
             streamId: event.streams[0]?.id
           });
 
+          // 3. If ontrack fires: Verify video.srcObject = event.streams[0]
           const remoteStream = event.streams[0] || new MediaStream([event.track]);
-
-          // Requirement 7: VIDEO_ATTACHED
-          signaling.logStage('VIDEO_ATTACHED', `Attached desktop stream to instructor video player for student ${studentId}`);
 
           signaling.updateDiagnostics({
             remoteStreamStatus: 'attached',
@@ -166,6 +228,24 @@ function InstructorLiveSessionContent() {
             ...prev,
             [studentId]: remoteStream
           }));
+
+          // Attach to focus video if currently visible
+          if (focusVideoRef.current) {
+            focusVideoRef.current.srcObject = remoteStream;
+            focusVideoRef.current.play().then(() => {
+              // Verify video.readyState, video.videoWidth, video.videoHeight
+              console.log("VIDEO PLAYING CONFIRMED:", {
+                readyState: focusVideoRef.current?.readyState,
+                videoWidth: focusVideoRef.current?.videoWidth,
+                videoHeight: focusVideoRef.current?.videoHeight
+              });
+              signaling.logStage('VIDEO_ATTACHED', `Video playing! ReadyState: ${focusVideoRef.current?.readyState}, Resolution: ${focusVideoRef.current?.videoWidth}x${focusVideoRef.current?.videoHeight}`);
+            }).catch(err => {
+              console.warn('Video play error:', err);
+            });
+          } else {
+            signaling.logStage('VIDEO_ATTACHED', `Desktop stream attached to station for student ${studentId}`);
+          }
 
           setParticipants(prev => {
             const exists = prev.find(p => p.studentId === studentId || p.studentRegistrationId === studentId);
@@ -198,6 +278,14 @@ function InstructorLiveSessionContent() {
           // Apply remote offer
           await pc.setRemoteDescription(new RTCSessionDescription(offer));
 
+          // 4. Verify transceiver direction is sendrecv NOT inactive recvonly
+          pc.getTransceivers().forEach((t, idx) => {
+            if (t.direction === 'recvonly' || t.direction === 'inactive') {
+              t.direction = 'sendrecv';
+            }
+            console.log(`Instructor Transceiver ${idx}: direction=${t.direction}, currentDirection=${t.currentDirection}`);
+          });
+
           // Flush queued candidates
           const pending = pendingCandidatesRef.current.get(studentId) || [];
           for (const cand of pending) {
@@ -205,18 +293,27 @@ function InstructorLiveSessionContent() {
           }
           pendingCandidatesRef.current.delete(studentId);
 
-          // Requirement 5: Create SDP Answer
-          const answer = await pc.createAnswer();
+          // 4. Create SDP Answer enforcing sendrecv
+          const answer = await pc.createAnswer({ offerToReceiveVideo: true });
+
+          // 4. Verify answer SDP contains: m=video
+          const answerHasVideo = answer.sdp ? answer.sdp.includes('m=video') : false;
+          console.log('ANSWER SDP contains m=video:', answerHasVideo);
+          if (!answerHasVideo) {
+            signaling.reportFailure('Answer Created', 'Generated SDP answer is missing m=video');
+          }
+
           await pc.setLocalDescription(answer);
 
           // Requirement 7: ANSWER_CREATED
-          signaling.logStage('ANSWER_CREATED', `SDP answer created for student ${studentId}`, { sdpType: answer.type });
+          signaling.logStage('ANSWER_CREATED', `SDP answer created for student ${studentId} (m=video verified)`, { sdpType: answer.type });
 
           // Requirement 5 & 7: Send Answer (ANSWER_SENT)
           await signaling.sendAnswer(studentId, answer);
 
         } catch (err: any) {
           console.error('Instructor offer/answer error:', err);
+          signaling.reportFailure('Answer Created', err?.message || 'Failed to create and dispatch answer');
         }
       });
 
@@ -251,10 +348,21 @@ function InstructorLiveSessionContent() {
 
   // Focus Mode Video Attachment: video.srcObject = remoteStream
   useEffect(() => {
-    if (focusVideoRef.current) {
-      if (focusedParticipant && remoteStreams[focusedParticipant.studentId]) {
-        focusVideoRef.current.srcObject = remoteStreams[focusedParticipant.studentId];
-        focusVideoRef.current.play().catch(e => console.log('Autoplay handled:', e));
+    if (focusVideoRef.current && focusedParticipant) {
+      const activeStream =
+        remoteStreams[focusedParticipant.studentId] ||
+        remoteStreams[focusedParticipant.studentRegistrationId] ||
+        (Object.keys(remoteStreams).length === 1 ? Object.values(remoteStreams)[0] : null);
+
+      if (activeStream) {
+        focusVideoRef.current.srcObject = activeStream;
+        focusVideoRef.current.play().then(() => {
+          console.log('[FOCUS VIDEO PLAYING]', {
+            readyState: focusVideoRef.current?.readyState,
+            videoWidth: focusVideoRef.current?.videoWidth,
+            videoHeight: focusVideoRef.current?.videoHeight
+          });
+        }).catch(e => console.log('Autoplay handled:', e));
       } else {
         focusVideoRef.current.srcObject = null;
       }
@@ -581,32 +689,42 @@ function InstructorLiveSessionContent() {
           </div>
 
           <div className="flex-1 bg-black rounded-b-xl border-x border-b border-gray-700 flex flex-col items-center justify-center p-3 relative overflow-hidden">
-            {remoteStreams[focusedParticipant.studentId] ? (
-              <video
-                ref={focusVideoRef}
-                autoPlay
-                playsInline
-                controls={false}
-                className="w-full h-full max-h-[82vh] object-contain rounded-lg shadow-2xl bg-black"
-              />
-            ) : (
-              <div className="w-full h-[600px] bg-[#0d1117] rounded-lg border border-gray-800 flex flex-col items-center justify-center space-y-3 p-6 text-center select-none">
-                <div className="w-14 h-14 rounded-2xl bg-gray-800/80 border border-gray-700 flex items-center justify-center text-emerald-400">
-                  <Monitor className="w-8 h-8 animate-pulse" />
-                </div>
-                <div className="space-y-1">
-                  <h3 className="text-white text-base font-bold">
-                    WebRTC Screen Stream Connecting
-                  </h3>
-                  <p className="text-xs text-gray-400 font-mono">
-                    Station: {focusedParticipant.studentRegistrationId} • Channel: session:{canonicalRoomId}
-                  </p>
-                </div>
-                <div className="text-[11px] text-gray-500 max-w-sm">
-                  Awaiting remote video track from student workstation...
-                </div>
-              </div>
-            )}
+            {(() => {
+              const activeStream =
+                remoteStreams[focusedParticipant.studentId] ||
+                remoteStreams[focusedParticipant.studentRegistrationId] ||
+                (Object.keys(remoteStreams).length === 1 ? Object.values(remoteStreams)[0] : null);
+
+              return (
+                <>
+                  <video
+                    ref={focusVideoRef}
+                    autoPlay
+                    playsInline
+                    controls={false}
+                    className={`w-full h-full max-h-[82vh] object-contain rounded-lg shadow-2xl bg-black ${!activeStream ? 'hidden' : ''}`}
+                  />
+                  {!activeStream && (
+                    <div className="w-full h-[600px] bg-[#0d1117] rounded-lg border border-gray-800 flex flex-col items-center justify-center space-y-3 p-6 text-center select-none">
+                      <div className="w-14 h-14 rounded-2xl bg-gray-800/80 border border-gray-700 flex items-center justify-center text-emerald-400">
+                        <Monitor className="w-8 h-8 animate-pulse" />
+                      </div>
+                      <div className="space-y-1">
+                        <h3 className="text-white text-base font-bold">
+                          WebRTC Screen Stream Connecting
+                        </h3>
+                        <p className="text-xs text-gray-400 font-mono">
+                          Station: {focusedParticipant.studentRegistrationId} • Channel: session:{canonicalRoomId}
+                        </p>
+                      </div>
+                      <div className="text-[11px] text-gray-500 max-w-sm">
+                        Awaiting remote video track from student workstation...
+                      </div>
+                    </div>
+                  )}
+                </>
+              );
+            })()}
           </div>
         </div>
       )}
@@ -778,15 +896,14 @@ function StudentScreenTile({
 
       {/* Actual WebRTC Screen Video Element */}
       <div className="relative aspect-video bg-black flex items-center justify-center overflow-hidden">
-        {hasLiveStream ? (
-          <video
-            ref={videoRef}
-            autoPlay
-            playsInline
-            muted
-            className="w-full h-full object-contain bg-black"
-          />
-        ) : (
+        <video
+          ref={videoRef}
+          autoPlay
+          playsInline
+          muted
+          className={`w-full h-full object-contain bg-black ${!hasLiveStream ? 'hidden' : ''}`}
+        />
+        {!hasLiveStream && (
           <div className="w-full h-full bg-[#0d1117] p-4 flex flex-col items-center justify-center space-y-2 text-center select-none">
             <div className="w-10 h-10 rounded-full bg-gray-800/80 border border-gray-700 flex items-center justify-center text-cyan-400">
               <Monitor className="w-5 h-5 animate-pulse" />
