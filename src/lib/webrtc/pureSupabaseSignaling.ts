@@ -26,7 +26,12 @@ export type StageName =
   | 'ICE_RECEIVED'
   | 'ICE_CONNECTED'
   | 'ONTRACK_FIRED'
-  | 'VIDEO_ATTACHED';
+  | 'VIDEO_ATTACHED'
+  | 'RECONNECT_STARTED'
+  | 'NEW_PC_CREATED'
+  | 'OFFER_REREQUESTED'
+  | 'ICE_RECONNECTED'
+  | 'VIDEO_REATTACHED';
 
 export interface StageLog {
   id: string;
@@ -286,19 +291,22 @@ export class PureSupabaseSignaling {
   }
 
   public onRequestOffer(handler: () => void) {
-    this.channel?.on('broadcast', { event: 'webrtc_request_offer' }, () => {
-      console.log(`[Supabase Realtime] Received offer request from instructor on ${this.channelName}`);
+    this.channel?.on('broadcast', { event: 'webrtc_request_offer' }, ({ payload }) => {
+      if (payload && payload.targetStudentId && payload.targetStudentId !== this.clientId) {
+        return; // Targeted to another student
+      }
+      console.log(`[Supabase Realtime] Received offer request on ${this.channelName}`);
       handler();
     });
   }
 
-  public async sendOfferRequest() {
+  public async sendOfferRequest(targetStudentId?: string) {
     if (!this.channel) return;
-    console.log(`[Supabase Realtime] Requesting active student offers on channel ${this.channelName}`);
+    console.log(`[Supabase Realtime] Requesting active offer on ${this.channelName} (target: ${targetStudentId || 'all'})`);
     await this.channel.send({
       type: 'broadcast',
       event: 'webrtc_request_offer',
-      payload: { sessionId: this.sessionId, timestamp: Date.now() }
+      payload: { sessionId: this.sessionId, targetStudentId, timestamp: Date.now() }
     });
   }
 

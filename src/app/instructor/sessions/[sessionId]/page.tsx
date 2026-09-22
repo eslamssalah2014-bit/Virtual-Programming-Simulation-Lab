@@ -118,6 +118,197 @@ function InstructorLiveSessionContent() {
     return () => { isMounted = false; };
   }, [rawSessionId]);
 
+  const lastRecoveryTimeRef = useRef<Map<string, number>>(new Map());
+
+  // Setup event handlers and transceivers on any RTCPeerConnection instance
+  const setupPeerConnection = (studentId: string, pc: RTCPeerConnection, studentName?: string) => {
+    const signaling = signalingRef.current;
+    if (!signaling) return;
+
+    pc.onconnectionstatechange = () => {
+      console.log(`[INSTRUCTOR ConnectionState for ${studentId}]: ${pc.connectionState}`);
+      signaling.updateDiagnostics({
+        iceStatus: {
+          ...signaling.getDiagnostics().iceStatus,
+          connectionState: pc.connectionState
+        }
+      });
+
+      if (pc.connectionState === 'connected') {
+        signaling.logStage('ICE_RECONNECTED', `PeerConnection reconnected for student ${studentId}`);
+      } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        console.warn(`[INSTRUCTOR] PeerConnection state is ${pc.connectionState}. Triggering auto-recovery for student ${studentId}...`);
+        triggerAutoRecoveryThrottled(studentId, `connectionState === "${pc.connectionState}"`);
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      console.log(`[INSTRUCTOR ICEConnectionState for ${studentId}]: ${pc.iceConnectionState}`);
+      signaling.updateDiagnostics({
+        iceStatus: {
+          ...signaling.getDiagnostics().iceStatus,
+          iceState: pc.iceConnectionState
+        }
+      });
+
+      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        signaling.logStage('ICE_RECONNECTED', `ICE connection reconnected for student ${studentId}`);
+      } else if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
+        console.warn(`[INSTRUCTOR] ICE connection state is ${pc.iceConnectionState}. Triggering auto-recovery for student ${studentId}...`);
+        triggerAutoRecoveryThrottled(studentId, `iceConnectionState === "${pc.iceConnectionState}"`);
+      }
+    };
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        signaling.sendIceCandidate(studentId, event.candidate, 'instructor', studentId);
+      }
+    };
+
+    // Pre-add video transceiver with sendrecv
+    try {
+      pc.addTransceiver('video', { direction: 'sendrecv' });
+    } catch (e) {
+      console.warn('addTransceiver video error:', e);
+    }
+
+    pc.ontrack = (event) => {
+      console.log("ONTRACK FIRED", event);
+
+      signaling.logStage('ONTRACK_FIRED', `pc.ontrack received live desktop track: ${event.track.label} (${event.track.readyState})`, {
+        trackKind: event.track.kind,
+        streamId: event.streams[0]?.id
+      });
+
+      const remoteStream = event.streams[0] || new MediaStream([event.track]);
+
+      signaling.updateDiagnostics({
+        remoteStreamStatus: 'attached',
+        activeTrackLabel: event.track.label
+      });
+
+      setRemoteStreams(prev => ({
+        ...prev,
+        [studentId]: remoteStream
+      }));
+
+      // Attach to focus video if currently visible
+      if (focusVideoRef.current) {
+        focusVideoRef.current.srcObject = remoteStream;
+        focusVideoRef.current.play().then(() => {
+          console.log("VIDEO PLAYING CONFIRMED:", {
+            readyState: focusVideoRef.current?.readyState,
+            videoWidth: focusVideoRef.current?.videoWidth,
+            videoHeight: focusVideoRef.current?.videoHeight
+          });
+          signaling.logStage('VIDEO_REATTACHED', `Video playing in Focus Mode! Resolution: ${focusVideoRef.current?.videoWidth}x${focusVideoRef.current?.videoHeight}`);
+        }).catch(err => {
+          console.warn('Video play error on reattach:', err);
+        });
+      } else {
+        signaling.logStage('VIDEO_ATTACHED', `Desktop stream attached to station for student ${studentId}`);
+      }
+
+      setParticipants(prev => {
+        const exists = prev.find(p => p.studentId === studentId || p.studentRegistrationId === studentId);
+        if (exists) {
+          return prev.map(p =>
+            p.studentId === studentId || p.studentRegistrationId === studentId
+              ? { ...p, isScreenSharing: true, status: 'Active', lastActivity: 'Streaming live desktop' }
+              : p
+          );
+        }
+        const newP: LabParticipant = {
+          studentId,
+          studentName: studentName || `Student ${studentId.slice(-4)}`,
+          studentRegistrationId: studentId,
+          studentEmail: `${studentId}@student.edu`,
+          status: 'Active',
+          isScreenSharing: true,
+          isHandRaised: false,
+          joinTime: new Date().toISOString(),
+          timeInLabSeconds: 0,
+          screenShareDurationSeconds: 0,
+          lastActivity: 'Streaming live desktop',
+          lastActivityTime: new Date().toISOString()
+        };
+        return [...prev, newP];
+      });
+    };
+  };
+
+  // Completely recreate connection: close old PC, instantiate new PC, re-request fresh offer
+  const initiateReconnection = async (studentId: string, reason: string) => {
+    const signaling = signalingRef.current;
+    if (!signaling) return;
+
+    console.log(`[WEBRTC_RECOVERY] Starting reconnection for student ${studentId}. Reason: ${reason}`);
+    signaling.logStage('RECONNECT_STARTED', `Initiating recovery for student ${studentId}: ${reason}`);
+
+    // 1. Close and clean up old PeerConnection (never reuse failed/closed/disconnected PC)
+    const oldPc = peerConnectionsRef.current.get(studentId);
+    if (oldPc) {
+      try {
+        oldPc.ontrack = null;
+        oldPc.onicecandidate = null;
+        oldPc.onconnectionstatechange = null;
+        oldPc.oniceconnectionstatechange = null;
+        oldPc.close();
+      } catch (e) {}
+      peerConnectionsRef.current.delete(studentId);
+    }
+
+    // 2. Create completely new RTCPeerConnection
+    const newPc = new RTCPeerConnection(RTC_STUN_CONFIGURATION);
+    peerConnectionsRef.current.set(studentId, newPc);
+    signaling.logStage('NEW_PC_CREATED', `Created fresh RTCPeerConnection for student ${studentId}`);
+
+    setupPeerConnection(studentId, newPc);
+
+    // 3. Clear stale remoteStream
+    setRemoteStreams(prev => {
+      const updated = { ...prev };
+      delete updated[studentId];
+      return updated;
+    });
+
+    // 4. Re-request offer from student (Force renegotiation)
+    signaling.logStage('OFFER_REREQUESTED', `Requesting fresh SDP offer from student ${studentId}`);
+    await signaling.sendOfferRequest(studentId);
+  };
+
+  // Cooldown-throttled automatic recovery trigger
+  const triggerAutoRecoveryThrottled = (studentId: string, reason: string) => {
+    const now = Date.now();
+    const last = lastRecoveryTimeRef.current.get(studentId) || 0;
+    if (now - last < 2500) {
+      console.log(`[AUTO_RECOVERY] Throttling recovery for ${studentId} (last attempt ${now - last}ms ago)`);
+      return;
+    }
+    lastRecoveryTimeRef.current.set(studentId, now);
+    initiateReconnection(studentId, reason);
+  };
+
+  // Focus Mode Open Handler: Recreates connection and re-requests offer if connection is not live
+  const handleOpenFocusMode = (participant: LabParticipant) => {
+    setFocusedParticipant(participant);
+    const studentId = participant.studentId;
+    const currentPc = peerConnectionsRef.current.get(studentId);
+
+    const isInvalid =
+      !currentPc ||
+      currentPc.connectionState === 'failed' ||
+      currentPc.connectionState === 'closed' ||
+      currentPc.connectionState === 'disconnected' ||
+      currentPc.iceConnectionState === 'failed' ||
+      currentPc.iceConnectionState === 'disconnected';
+
+    console.log(`[FOCUS_MODE_OPEN] Student ${studentId}, connectionState: ${currentPc?.connectionState}, isInvalid: ${isInvalid}`);
+
+    // When Focus Mode reopens: create a completely new RTCPeerConnection and force renegotiation
+    initiateReconnection(studentId, `Focus Mode opened (state: ${currentPc?.connectionState || 'none'})`);
+  };
+
   // 2. Setup Pure Supabase Realtime Signaling Client
   useEffect(() => {
     if (!session || !session.id) return;
@@ -154,125 +345,18 @@ function InstructorLiveSessionContent() {
           signaling.reportFailure('Offer Received', 'Received SDP offer is missing m=video media description');
         }
 
-        // Reset any existing connection for this student
-        if (peerConnectionsRef.current.has(studentId)) {
-          peerConnectionsRef.current.get(studentId)?.close();
-          peerConnectionsRef.current.delete(studentId);
+        // Never reuse a failed, closed, or disconnected PeerConnection
+        let pc = peerConnectionsRef.current.get(studentId);
+        if (!pc || pc.connectionState === 'failed' || pc.connectionState === 'closed' || pc.connectionState === 'disconnected') {
+          if (pc) {
+            try { pc.close(); } catch (e) {}
+            peerConnectionsRef.current.delete(studentId);
+          }
+          pc = new RTCPeerConnection(RTC_STUN_CONFIGURATION);
+          peerConnectionsRef.current.set(studentId, pc);
+          signaling.logStage('NEW_PC_CREATED', `Created fresh RTCPeerConnection for student ${studentId}`);
+          setupPeerConnection(studentId, pc, studentName);
         }
-
-        const pc = new RTCPeerConnection(RTC_STUN_CONFIGURATION);
-        peerConnectionsRef.current.set(studentId, pc);
-
-        pc.onconnectionstatechange = () => {
-          console.log(`[INSTRUCTOR ConnectionState for ${studentId}]: ${pc.connectionState}`);
-          signaling.updateDiagnostics({
-            iceStatus: {
-              ...signaling.getDiagnostics().iceStatus,
-              connectionState: pc.connectionState
-            }
-          });
-          if (pc.connectionState === 'connected') {
-            signaling.logStage('ICE_CONNECTED', `PeerConnection connected for student ${studentId}`);
-          } else if (pc.connectionState === 'failed') {
-            signaling.reportFailure('ICE Connected', `PeerConnection state FAILED for student ${studentId}`);
-          }
-        };
-
-        pc.oniceconnectionstatechange = () => {
-          console.log(`[INSTRUCTOR ICEConnectionState for ${studentId}]: ${pc.iceConnectionState}`);
-          signaling.updateDiagnostics({
-            iceStatus: {
-              ...signaling.getDiagnostics().iceStatus,
-              iceState: pc.iceConnectionState
-            }
-          });
-          if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-            signaling.logStage('ICE_CONNECTED', `ICE connection connected for student ${studentId}`);
-          } else if (pc.iceConnectionState === 'failed') {
-            signaling.reportFailure('ICE Connected', `ICE connection FAILED for student ${studentId}`);
-          }
-        };
-
-        // Requirement 5: Instructor sends ICE candidates
-        pc.onicecandidate = (event) => {
-          if (event.candidate) {
-            signaling.sendIceCandidate(studentId, event.candidate, 'instructor', studentId);
-          }
-        };
-
-        // 4. Pre-add video transceiver with sendrecv
-        try {
-          pc.addTransceiver('video', { direction: 'sendrecv' });
-        } catch (e) {
-          console.warn('addTransceiver video error:', e);
-        }
-
-        // 2. On the INSTRUCTOR side: Verify pc.ontrack = (event) => { console.log("ONTRACK FIRED", event) }
-        pc.ontrack = (event) => {
-          console.log("ONTRACK FIRED", event);
-
-          signaling.logStage('ONTRACK_FIRED', `pc.ontrack received live desktop track: ${event.track.label} (${event.track.readyState})`, {
-            trackKind: event.track.kind,
-            streamId: event.streams[0]?.id
-          });
-
-          // 3. If ontrack fires: Verify video.srcObject = event.streams[0]
-          const remoteStream = event.streams[0] || new MediaStream([event.track]);
-
-          signaling.updateDiagnostics({
-            remoteStreamStatus: 'attached',
-            activeTrackLabel: event.track.label
-          });
-
-          setRemoteStreams(prev => ({
-            ...prev,
-            [studentId]: remoteStream
-          }));
-
-          // Attach to focus video if currently visible
-          if (focusVideoRef.current) {
-            focusVideoRef.current.srcObject = remoteStream;
-            focusVideoRef.current.play().then(() => {
-              // Verify video.readyState, video.videoWidth, video.videoHeight
-              console.log("VIDEO PLAYING CONFIRMED:", {
-                readyState: focusVideoRef.current?.readyState,
-                videoWidth: focusVideoRef.current?.videoWidth,
-                videoHeight: focusVideoRef.current?.videoHeight
-              });
-              signaling.logStage('VIDEO_ATTACHED', `Video playing! ReadyState: ${focusVideoRef.current?.readyState}, Resolution: ${focusVideoRef.current?.videoWidth}x${focusVideoRef.current?.videoHeight}`);
-            }).catch(err => {
-              console.warn('Video play error:', err);
-            });
-          } else {
-            signaling.logStage('VIDEO_ATTACHED', `Desktop stream attached to station for student ${studentId}`);
-          }
-
-          setParticipants(prev => {
-            const exists = prev.find(p => p.studentId === studentId || p.studentRegistrationId === studentId);
-            if (exists) {
-              return prev.map(p =>
-                p.studentId === studentId || p.studentRegistrationId === studentId
-                  ? { ...p, isScreenSharing: true, status: 'Active', lastActivity: 'Streaming live desktop' }
-                  : p
-              );
-            }
-            const newP: LabParticipant = {
-              studentId,
-              studentName: studentName || `Student ${studentId.slice(-4)}`,
-              studentRegistrationId: studentId,
-              studentEmail: `${studentId}@student.edu`,
-              status: 'Active',
-              isScreenSharing: true,
-              isHandRaised: false,
-              joinTime: new Date().toISOString(),
-              timeInLabSeconds: 0,
-              screenShareDurationSeconds: 0,
-              lastActivity: 'Streaming live desktop',
-              lastActivityTime: new Date().toISOString()
-            };
-            return [...prev, newP];
-          });
-        };
 
         try {
           // Apply remote offer
@@ -354,17 +438,16 @@ function InstructorLiveSessionContent() {
         remoteStreams[focusedParticipant.studentRegistrationId] ||
         (Object.keys(remoteStreams).length === 1 ? Object.values(remoteStreams)[0] : null);
 
-      if (activeStream) {
+      if (activeStream && activeStream.getVideoTracks().some(t => t.readyState === 'live')) {
         focusVideoRef.current.srcObject = activeStream;
         focusVideoRef.current.play().then(() => {
-          console.log('[FOCUS VIDEO PLAYING]', {
+          console.log('[FOCUS VIDEO PLAYING CONFIRMED]', {
             readyState: focusVideoRef.current?.readyState,
             videoWidth: focusVideoRef.current?.videoWidth,
             videoHeight: focusVideoRef.current?.videoHeight
           });
+          signalingRef.current?.logStage('VIDEO_REATTACHED', `Stream reattached in Focus Mode (${focusVideoRef.current?.videoWidth}x${focusVideoRef.current?.videoHeight})`);
         }).catch(e => console.log('Autoplay handled:', e));
-      } else {
-        focusVideoRef.current.srcObject = null;
       }
     }
   }, [focusedParticipant, remoteStreams]);
@@ -403,13 +486,13 @@ function InstructorLiveSessionContent() {
 
   const handlePrevFocus = () => {
     if (currentIndex > 0) {
-      setFocusedParticipant(filteredParticipants[currentIndex - 1]);
+      handleOpenFocusMode(filteredParticipants[currentIndex - 1]);
     }
   };
 
   const handleNextFocus = () => {
     if (currentIndex < filteredParticipants.length - 1 && currentIndex !== -1) {
-      setFocusedParticipant(filteredParticipants[currentIndex + 1]);
+      handleOpenFocusMode(filteredParticipants[currentIndex + 1]);
     }
   };
 
@@ -598,7 +681,7 @@ function InstructorLiveSessionContent() {
               key={participant.studentId}
               participant={participant}
               remoteStream={remoteStreams[participant.studentId]}
-              onFocus={() => setFocusedParticipant(participant)}
+              onFocus={() => handleOpenFocusMode(participant)}
               onLowerHand={() => handleLowerHand(participant.studentId)}
             />
           ))}
