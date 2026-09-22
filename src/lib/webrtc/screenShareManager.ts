@@ -54,6 +54,7 @@ export class ScreenShareManager {
     onDiagnosticsChange?: DiagnosticsUpdateCallback;
     onRemoteStreamReceived?: (studentId: string, stream: MediaStream) => void;
     onScreenSharingEnded?: () => void;
+    onLog?: (log: SignalingLog) => void;
   }) {
     this.role = options.role;
     this.sessionId = options.sessionId;
@@ -89,6 +90,7 @@ export class ScreenShareManager {
       clientId: this.clientId,
       role: this.role,
       userName: this.userName,
+      onLog: options.onLog,
       onPresenceChange: (presence) => {
         this.updateDiagnostics({
           studentConnected: presence.studentConnected,

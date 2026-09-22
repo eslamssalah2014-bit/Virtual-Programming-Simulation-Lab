@@ -12,7 +12,7 @@ interface SignalingMessage {
   timestamp: number;
 }
 
-// Global in-memory message queue for Vercel serverless signaling
+// Global in-memory message queue for same-process fallback
 declare global {
   var __vlabSignalingStore: SignalingMessage[] | undefined;
 }
@@ -39,7 +39,7 @@ const resolveCanonicalRoomId = (idOrCode: string): string => {
     const session = dbStore.getSession(idOrCode);
     if (session) return session.id;
   } catch (e) {}
-  return idOrCode.toLowerCase().trim();
+  return idOrCode.toLowerCase().replace(/[^a-z0-9_-]/g, '').trim();
 };
 
 export async function POST(req: NextRequest) {
@@ -68,6 +68,16 @@ export async function POST(req: NextRequest) {
 
     getStore().push(message);
 
+    // Forward to persistent cloud topic for cross-container synchronization
+    const ntfyTopic = `vlab_sig_${canonicalRoomId}`;
+    try {
+      fetch(`https://ntfy.sh/${ntfyTopic}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(message)
+      }).catch(() => {});
+    } catch (_) {}
+
     return NextResponse.json({
       success: true,
       messageId: message.id,
@@ -93,56 +103,60 @@ export async function GET(req: NextRequest) {
 
   const canonicalRoomId = resolveCanonicalRoomId(sessionId);
 
-  // Filter messages for this room, received after 'since', not from self
-  const messages = getStore().filter(m => {
-    // 1. Room matching (accepts either raw sessionId or canonicalRoomId)
+  // Local memory messages
+  const localMessages = getStore().filter(m => {
     const matchesRoom =
       m.canonicalRoomId === canonicalRoomId ||
       m.sessionId === sessionId ||
-      m.sessionId.toLowerCase() === sessionId.toLowerCase();
-
+      m.sessionId === canonicalRoomId;
     if (!matchesRoom) return false;
-
-    // 2. Ignore messages sent by self
     if (m.from === clientId) return false;
-
-    // 3. Ignore messages received before 'since' timestamp
-    if (m.timestamp <= since) return false;
-
-    // 4. Role-based and recipient routing
-    if (m.to === 'all') return true;
-    if (m.to === clientId) return true;
-
-    // If client is instructor, deliver all messages directed to instructor or offers from students
-    if (role === 'instructor') {
-      if (m.to === 'instructor') return true;
-      if (m.type === 'webrtc_offer') return true;
-      if (m.type === 'student_raise_hand') return true;
-      if (m.type === 'student_screen_status') return true;
-      if (m.payload?.fromRole === 'student' && m.type === 'webrtc_ice_candidate') return true;
+    if (m.to !== 'all' && m.to !== clientId && !(role === 'instructor' && m.to === 'instructor')) {
+      return false;
     }
-
-    // If client is student, deliver answers and candidates directed to them
-    if (role === 'student') {
-      if (m.to === 'student') return true;
-      if (m.type === 'webrtc_answer') {
-        // Matches studentId, targetId, or registration id
-        if (m.to === clientId || m.payload?.studentId === clientId || m.payload?.targetId === clientId) {
-          return true;
-        }
-      }
-      if (m.type === 'webrtc_ice_candidate') {
-        if (m.payload?.fromRole === 'instructor' && (m.to === clientId || m.payload?.targetId === clientId || !m.payload?.targetId)) {
-          return true;
-        }
-      }
-    }
-
-    return false;
+    return m.timestamp > since;
   });
 
+  // Pull cloud messages from persistent topic to bridge serverless containers
+  let cloudMessages: SignalingMessage[] = [];
+  try {
+    const ntfyTopic = `vlab_sig_${canonicalRoomId}`;
+    const sinceUnix = Math.floor(since / 1000);
+    const res = await fetch(`https://ntfy.sh/${ntfyTopic}/json?poll=1&since=${sinceUnix > 0 ? sinceUnix : '30s'}`, {
+      cache: 'no-store'
+    });
+    if (res.ok) {
+      const text = await res.text();
+      const lines = text.trim().split('\n');
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const entry = JSON.parse(line);
+          if (entry.event === 'message' && entry.message) {
+            const parsed = JSON.parse(entry.message);
+            if (parsed && parsed.from !== clientId) {
+              cloudMessages.push(parsed);
+            }
+          }
+        } catch (_) {}
+      }
+    }
+  } catch (_) {}
+
+  // Deduplicate combined messages
+  const seenIds = new Set<string>();
+  const combined: SignalingMessage[] = [];
+
+  for (const m of [...localMessages, ...cloudMessages]) {
+    const id = m.id || `${m.type}_${m.from}_${m.timestamp}`;
+    if (!seenIds.has(id)) {
+      seenIds.add(id);
+      combined.push(m);
+    }
+  }
+
   return NextResponse.json({
-    messages,
+    messages: combined,
     serverTime: Date.now(),
     canonicalRoomId
   });

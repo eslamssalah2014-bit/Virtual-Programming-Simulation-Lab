@@ -74,6 +74,7 @@ function StudentLabWorkstationContent() {
     failedStage: null,
     errorMessage: null
   });
+  const [signalingLogs, setSignalingLogs] = useState<any[]>([]);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -139,6 +140,9 @@ function StudentLabWorkstationContent() {
       userName: studentName.trim() || currentUser?.fullName || 'Student',
       onDiagnosticsChange: (state) => {
         setDiagnostics(state);
+      },
+      onLog: (entry) => {
+        setSignalingLogs(prev => [entry, ...prev.slice(0, 199)]);
       },
       onScreenSharingEnded: () => {
         setIsScreenSharing(false);
@@ -518,6 +522,7 @@ function StudentLabWorkstationContent() {
       <ScreenShareDiagnosticsPanel
         diagnostics={diagnostics}
         role="student"
+        logs={signalingLogs}
         onRestartIce={() => screenShareManagerRef.current?.restartIce()}
       />
 

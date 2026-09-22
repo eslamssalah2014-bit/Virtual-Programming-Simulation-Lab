@@ -69,6 +69,7 @@ function InstructorLiveSessionContent() {
     failedStage: null,
     errorMessage: null
   });
+  const [signalingLogs, setSignalingLogs] = useState<any[]>([]);
 
   // WebRTC Multi-Peer Real Streams Map: studentId -> MediaStream
   const [remoteStreams, setRemoteStreams] = useState<Record<string, MediaStream>>({});
@@ -138,6 +139,9 @@ function InstructorLiveSessionContent() {
       userName: 'Instructor',
       onDiagnosticsChange: (state) => {
         setDiagnostics(state);
+      },
+      onLog: (entry) => {
+        setSignalingLogs(prev => [entry, ...prev.slice(0, 199)]);
       },
       onRemoteStreamReceived: (studentId, stream) => {
         console.log(`[Instructor Station] Bound real remote stream for student: ${studentId}`, stream);
@@ -439,6 +443,7 @@ function InstructorLiveSessionContent() {
       <ScreenShareDiagnosticsPanel
         diagnostics={diagnostics}
         role="instructor"
+        logs={signalingLogs}
         onRestartIce={() => screenShareManagerRef.current?.restartIce()}
       />
 
